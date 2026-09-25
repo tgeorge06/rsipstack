@@ -857,6 +857,7 @@ impl ServerInviteDialog {
             if let SipMessage::Request(req) = msg {
                 if req.method == crate::sip::Method::Ack {
                     debug!(id = %self.id(),"received ack for re-invite {}", req.uri);
+                    self.inner.remote_ack.lock().replace(req);
                     self.inner.transition(DialogState::Confirmed(
                         self.id(),
                         tx.last_response.clone().unwrap_or_default(),
@@ -889,6 +890,7 @@ impl ServerInviteDialog {
                                 break;
                             }
                             debug!(id = %self.id(),"received ack {}", req.uri);
+                            self.inner.remote_ack.lock().replace(req);
                             self.inner.transition(DialogState::Confirmed(
                                 self.id(),
                                 tx.last_response.clone().unwrap_or_default(),
