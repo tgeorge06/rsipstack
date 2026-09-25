@@ -1248,7 +1248,17 @@ impl DialogInner {
                         if method == Method::Invite {
                             self.handle_provisional_response(&resp).await?;
                         }
-                        self.transition(DialogState::Early(self.id.lock().clone(), resp))?;
+                        // RFC 3261 §12: a dialog moves from early to confirmed
+                        // and never back. A 1xx to a mid-dialog request (re-INVITE,
+                        // UPDATE, ...) must not regress an established dialog to
+                        // Early, or BYE is refused and hangup() tries to CANCEL.
+                        // The provisional is still notified so the caller sees it.
+                        let state = DialogState::Early(self.id.lock().clone(), resp);
+                        if self.can_cancel() {
+                            self.transition(state)?;
+                        } else {
+                            self.state_sender.send(state).ok();
+                        }
                         continue;
                     }
 
@@ -1514,18 +1524,20 @@ impl DialogInner {
         }
     }
     pub(super) fn transition(&self, state: DialogState) -> Result<()> {
-        // Try to send state update, but don't fail if channel is closed
-        self.state_sender.send(state.clone()).ok();
-
         match state {
             DialogState::Updated(_, _, _)
             | DialogState::Notify(_, _, _)
             | DialogState::Info(_, _, _)
             | DialogState::Options(_, _, _) => {
+                // Try to send state update, but don't fail if channel is closed
+                self.state_sender.send(state).ok();
                 return Ok(());
             }
             _ => {}
         }
+        // Notify only transitions that are actually applied, and do it while
+        // holding the state lock so notifications follow the order in which
+        // the state changed.
         let mut old_state = self.state.lock();
         match (&*old_state, &state) {
             (DialogState::Terminated(id, _), _) => {
@@ -1543,7 +1555,9 @@ impl DialogInner {
             _ => {}
         }
         debug!(from = %old_state, to = %state, "transitioning state");
-        *old_state = state;
+        *old_state = state.clone();
+        // Try to send state update, but don't fail if channel is closed
+        self.state_sender.send(state).ok();
         Ok(())
     }
 
