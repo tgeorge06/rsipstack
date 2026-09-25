@@ -59,6 +59,19 @@ impl InviteDialog {
         &self.inner.cancel_token
     }
 
+    /// The most recent ACK received for an INVITE or re-INVITE this dialog
+    /// answered, or `None` if none has been received yet.
+    ///
+    /// When the INVITE or re-INVITE carried no offer, the offer goes in the
+    /// 2xx and the answer comes back in the ACK body (RFC 3261 §13.2.1,
+    /// §14.2). The ACK is recorded before the `Confirmed` state it causes is
+    /// notified. `Confirmed` is also notified after other mid-dialog
+    /// requests, so match the ACK's CSeq against the INVITE it should
+    /// acknowledge.
+    pub fn last_remote_ack(&self) -> Option<Request> {
+        self.inner.remote_ack.lock().clone()
+    }
+
     /// The initial INVITE request that created this dialog.
     pub fn initial_request(&self) -> Request {
         self.inner.initial_request.lock().clone()
@@ -808,6 +821,7 @@ impl InviteDialog {
             if let SipMessage::Request(req) = msg {
                 if req.method == Method::Ack {
                     debug!(id = %self.id(), "received ack for re-invite {}", req.uri);
+                    self.inner.remote_ack.lock().replace(req);
                     self.inner.transition(DialogState::Confirmed(
                         self.id(),
                         tx.last_response.clone().unwrap_or_default(),
@@ -840,6 +854,7 @@ impl InviteDialog {
                                 break;
                             }
                             debug!(id = %self.id(), "received ack {}", req.uri);
+                            self.inner.remote_ack.lock().replace(req);
                             self.inner.transition(DialogState::Confirmed(
                                 self.id(),
                                 tx.last_response.clone().unwrap_or_default(),
