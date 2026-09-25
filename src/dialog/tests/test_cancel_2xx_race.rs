@@ -374,3 +374,134 @@ async fn test_explicit_cancel_crossing_2xx_is_returned_to_the_caller() -> crate:
     token.cancel();
     Ok(())
 }
+
+/// Abandoned before any provisional: RFC 3261 §9.1 forbids a CANCEL until a
+/// provisional arrives, so the UAC must wait for one and CANCEL then; a 2xx
+/// arriving instead must be ACKed and BYE'd.
+#[tokio::test]
+async fn test_abandoned_before_provisional_cancels_after_first_provisional() -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let Uac {
+        dialog_layer,
+        option,
+        peer,
+    } = setup(&token).await?;
+    let wait = Duration::from_secs(2);
+
+    let (state_sender, _states) = unbounded_channel();
+    let invite = tokio::spawn(async move { dialog_layer.do_invite(option, state_sender).await });
+    let (inv, uac) = recv_request(&peer, Method::Invite, wait).await;
+    invite.abort();
+    let _ = invite.await;
+
+    reply(&peer, uac, &inv, 180, "Ringing").await;
+    let (cancel, _) = recv_request(&peer, Method::Cancel, wait).await;
+    assert_eq!(
+        cancel.call_id_header().unwrap().value(),
+        inv.call_id_header().unwrap().value()
+    );
+    reply(&peer, uac, &cancel, 200, "OK").await;
+    reply(&peer, uac, &inv, 487, "Request Terminated").await;
+    recv_request(&peer, Method::Ack, wait).await;
+    token.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_abandoned_before_provisional_2xx_is_acked_and_byed() -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let Uac {
+        dialog_layer,
+        option,
+        peer,
+    } = setup(&token).await?;
+    let wait = Duration::from_secs(2);
+
+    let (state_sender, _states) = unbounded_channel();
+    let invite = tokio::spawn(async move { dialog_layer.do_invite(option, state_sender).await });
+    let (inv, uac) = recv_request(&peer, Method::Invite, wait).await;
+    invite.abort();
+    let _ = invite.await;
+
+    reply(&peer, uac, &inv, 200, "OK").await;
+    let (ack, _) = recv_request(&peer, Method::Ack, wait).await;
+    assert_in_dialog(&ack, &inv, "ACK");
+    let (bye, _) = recv_request(&peer, Method::Bye, wait).await;
+    assert_in_dialog(&bye, &inv, "BYE");
+    token.cancel();
+    Ok(())
+}
+
+/// Dropped before any response: Terminated(UacCancel) is still reported at
+/// once, and with no provisional nothing is sent (no CANCEL, no BYE).
+#[tokio::test]
+async fn test_abandoned_before_provisional_terminates_at_once_and_sends_nothing(
+) -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let Uac {
+        dialog_layer,
+        option,
+        peer,
+    } = setup(&token).await?;
+    let wait = Duration::from_secs(2);
+
+    let (state_sender, mut states) = unbounded_channel();
+    let invite = tokio::spawn(async move { dialog_layer.do_invite(option, state_sender).await });
+    recv_request(&peer, Method::Invite, wait).await;
+    invite.abort();
+    let _ = invite.await;
+    let terminated = wait_for_state(&mut states, "Terminated", Duration::from_millis(200), |s| {
+        matches!(s, DialogState::Terminated(_, _))
+    })
+    .await;
+    assert!(matches!(
+        terminated,
+        DialogState::Terminated(_, TerminatedReason::UacCancel)
+    ));
+
+    let mut buf = vec![0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    while let Ok(Ok((len, _))) = tokio::time::timeout_at(deadline, peer.recv_from(&mut buf)).await {
+        let text = std::str::from_utf8(&buf[..len]).unwrap();
+        if let Ok(SipMessage::Request(req)) = SipMessage::try_from(text) {
+            assert!(
+                !matches!(req.method, Method::Cancel | Method::Bye),
+                "nothing may be sent before a provisional, got {}",
+                req.method
+            );
+        }
+    }
+    token.cancel();
+    Ok(())
+}
+
+/// Dropped before any response, then the callee rings and answers while the
+/// deferred CANCEL is in flight: the 2xx is ACKed and BYE'd.
+#[tokio::test]
+async fn test_abandoned_before_provisional_2xx_crossing_deferred_cancel_is_byed(
+) -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let Uac {
+        dialog_layer,
+        option,
+        peer,
+    } = setup(&token).await?;
+    let wait = Duration::from_secs(2);
+
+    let (state_sender, _states) = unbounded_channel();
+    let invite = tokio::spawn(async move { dialog_layer.do_invite(option, state_sender).await });
+    let (inv, uac) = recv_request(&peer, Method::Invite, wait).await;
+    invite.abort();
+    let _ = invite.await;
+
+    reply(&peer, uac, &inv, 180, "Ringing").await;
+    let (cancel, _) = recv_request(&peer, Method::Cancel, wait).await;
+    reply(&peer, uac, &inv, 200, "OK").await;
+    reply(&peer, uac, &cancel, 200, "OK").await;
+    let (ack, _) = recv_request(&peer, Method::Ack, wait).await;
+    assert_in_dialog(&ack, &inv, "ACK");
+    let (bye, _) = recv_request(&peer, Method::Bye, wait).await;
+    assert_in_dialog(&bye, &inv, "BYE");
+    token.cancel();
+    Ok(())
+}
