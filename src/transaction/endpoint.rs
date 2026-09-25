@@ -111,6 +111,11 @@ pub struct EndpointInner {
     pub finished_transactions: DashMap<TransactionKey, Option<SipMessage>>,
     pub transactions: DashMap<TransactionKey, TransactionEventSender>,
     pub waiting_ack: DashMap<DialogId, TransactionKey>,
+    /// Server INVITE transactions waiting for the ACK of their 2xx, by dialog
+    /// and INVITE CSeq number. `waiting_ack` holds only the latest INVITE of a
+    /// dialog; the ACK of an earlier re-INVITE can arrive after the next one
+    /// (RFC 3261 §13.2.2.4: the ACK carries the CSeq number of its INVITE).
+    pub(crate) waiting_ack_cseq: DashMap<(DialogId, u32), TransactionKey>,
     incoming_sender: TransactionSender,
     incoming_receiver: Mutex<Option<TransactionReceiver>>,
     cancel_token: CancellationToken,
@@ -230,6 +235,7 @@ impl EndpointInner {
             transactions: DashMap::new(),
             finished_transactions: DashMap::new(),
             waiting_ack: DashMap::new(),
+            waiting_ack_cseq: DashMap::new(),
             timer_interval: timer_interval.unwrap_or(Duration::from_millis(20)),
             cancel_token,
             incoming_sender,
@@ -303,6 +309,7 @@ impl EndpointInner {
                     self.transactions.remove(&key);
                     self.finished_transactions.remove(&key);
                     self.waiting_ack.retain(|_, v| v != &key);
+                    self.waiting_ack_cseq.retain(|_, v| v != &key);
                     continue;
                 }
 
@@ -363,7 +370,15 @@ impl EndpointInner {
                     if let Ok(dialog_id) =
                         DialogId::try_from((req, super::key::TransactionRole::Server))
                     {
-                        if let Some(tx_key) = self.waiting_ack.get(&dialog_id).map(|v| v.clone()) {
+                        // Route by dialog AND CSeq number, so the ACK of an
+                        // earlier re-INVITE reaches its own transaction and is
+                        // never taken for the ACK of a later one.
+                        let ack_cseq = req.cseq_header()?.seq()?;
+                        if let Some(tx_key) = self
+                            .waiting_ack_cseq
+                            .get(&(dialog_id, ack_cseq))
+                            .map(|v| v.clone())
+                        {
                             key = tx_key;
                         }
                     }
@@ -381,7 +396,8 @@ impl EndpointInner {
                         if let Ok(dialog_id) =
                             DialogId::try_from((req, super::key::TransactionRole::Server))
                         {
-                            self.waiting_ack.remove(&dialog_id);
+                            self.waiting_ack.remove_if(&dialog_id, |_, v| v == &key);
+                            self.waiting_ack_cseq.retain(|_, v| v != &key);
                         }
                         return Ok(());
                     }

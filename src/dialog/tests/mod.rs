@@ -9,6 +9,7 @@ mod test_dialog_states;
 mod test_in_dialog_provisional;
 mod test_in_dialog_via;
 mod test_invite_auth_challenge;
+mod test_late_reinvite_ack;
 mod test_prack;
 mod test_proxy_headers;
 mod test_refer;
