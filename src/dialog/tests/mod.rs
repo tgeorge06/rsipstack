@@ -1,4 +1,5 @@
 mod test_authenticate;
+mod test_bye_after_peer_closed;
 mod test_client_dialog;
 mod test_connection_affinity;
 mod test_dialog_layer;
