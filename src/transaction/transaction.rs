@@ -986,6 +986,11 @@ impl Transaction {
                     debug!(key=%self.key, last = self.last_response.is_none(), "entered confirmed state, waiting for ACK");
                     if let Some(ref resp) = self.last_response {
                         let dialog_id = DialogId::try_from((resp, TransactionRole::Server))?;
+                        if let Ok(seq) = self.original.cseq_header().and_then(|c| c.seq()) {
+                            self.endpoint_inner
+                                .waiting_ack_cseq
+                                .insert((dialog_id.clone(), seq), self.key.clone());
+                        }
                         self.endpoint_inner
                             .waiting_ack
                             .insert(dialog_id, self.key.clone());
@@ -1010,7 +1015,12 @@ impl Transaction {
                 if self.transaction_type == TransactionType::ServerInvite {
                     if let Some(ref resp) = self.last_response {
                         if let Ok(dialog_id) = DialogId::try_from((resp, self.role())) {
-                            self.endpoint_inner.waiting_ack.remove(&dialog_id);
+                            // Only our own entries: a later re-INVITE on this
+                            // dialog may have replaced it in `waiting_ack`.
+                            self.endpoint_inner
+                                .waiting_ack
+                                .remove_if(&dialog_id, |_, v| v == &self.key);
+                            self.remove_waiting_ack_cseq(dialog_id);
                         }
                     }
                 }
@@ -1035,6 +1045,14 @@ impl Transaction {
         );
         self.state = state;
         Ok(self.state.clone())
+    }
+
+    fn remove_waiting_ack_cseq(&self, dialog_id: DialogId) {
+        if let Ok(seq) = self.original.cseq_header().and_then(|c| c.seq()) {
+            self.endpoint_inner
+                .waiting_ack_cseq
+                .remove_if(&(dialog_id, seq), |_, v| v == &self.key);
+        }
     }
 
     fn cleanup_timer(&mut self) {
@@ -1083,11 +1101,13 @@ impl Transaction {
         if !is_server_invite_waiting_ack {
             match self.last_response {
                 Some(ref resp) => match DialogId::try_from((resp, self.role())) {
-                    Ok(dialog_id) => self
-                        .endpoint_inner
-                        .waiting_ack
-                        .remove(&dialog_id)
-                        .map(|_| ()),
+                    Ok(dialog_id) => {
+                        self.remove_waiting_ack_cseq(dialog_id.clone());
+                        self.endpoint_inner
+                            .waiting_ack
+                            .remove_if(&dialog_id, |_, v| v == &self.key)
+                            .map(|_| ())
+                    }
                     Err(_) => None,
                 },
                 _ => None,
