@@ -675,6 +675,7 @@ impl ClientInviteDialog {
             match msg {
                 SipMessage::Request(req) if req.method == crate::sip::Method::Ack => {
                     debug!(id = %self.id(), "received ACK for re-INVITE");
+                    self.inner.remote_ack.lock().replace(req);
                     break;
                 }
                 _ => {}
@@ -776,12 +777,15 @@ impl ClientInviteDialog {
                             }
                             continue;
                         } else {
-                            debug!(id=%self.id(),"received 407 response without auth option");
+                            // No credential to retry with: the challenge is the
+                            // final response (RFC 3261 §22.2, §22.3).
+                            final_response = Some(resp);
+                            debug!(id = %self.id(), ?status, "received auth challenge without credential");
                             self.inner.transition(DialogState::Terminated(
                                 self.id(),
                                 TerminatedReason::ProxyAuthRequired,
                             ))?;
-                            continue;
+                            break;
                         }
                     }
                     final_response = Some(resp.clone());

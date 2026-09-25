@@ -332,6 +332,9 @@ pub struct DialogInner {
     pub(super) initial_request: Mutex<Request>,
     pub(super) supports_100rel: bool,
     pub(super) remote_reliable: Mutex<Option<RemoteReliableState>>,
+    /// The last ACK received for an INVITE or re-INVITE this dialog answered
+    /// (UAS role). Carries the answer when the 2xx carried the offer.
+    pub(super) remote_ack: Mutex<Option<Request>>,
     pub(super) server_connection: Mutex<Option<SipConnection>>,
     /// Structural source address of the flow that created this server dialog,
     /// captured at creation time from the connection itself (not parsed from
@@ -497,6 +500,7 @@ impl DialogInner {
             remote_contact: Mutex::new(None),
             supports_100rel,
             remote_reliable: Mutex::new(None),
+            remote_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
         })
@@ -895,8 +899,45 @@ impl DialogInner {
         headers: Option<Vec<crate::sip::Header>>,
         body: Option<Vec<u8>>,
     ) -> Result<crate::sip::Request> {
+        let addr = addr.or_else(|| self.via_addr_for_send_transport());
         let via = self.endpoint_inner.get_via(addr, branch)?;
         self.make_request_with_vias(method, cseq, vec![via], headers, body)
+    }
+
+    /// The listener address whose transport matches the one an in-dialog
+    /// request will be sent over: the reliable flow reused by affinity, else
+    /// the outbound proxy, else the transport of the first route, else of the
+    /// remote target. The Via must name the transport the request is sent on
+    /// (RFC 3261 §18.1.1); `make_invite_request` does the same for the
+    /// initial INVITE. `None` keeps the endpoint's default (first) listener,
+    /// also when a target locator decides the transport at send time.
+    fn via_addr_for_send_transport(&self) -> Option<crate::transport::SipAddr> {
+        use crate::sip::uri::ParamsExt;
+
+        let transport = match self.resolve_affinity_connection() {
+            Some(connection) => connection.get_addr().r#type,
+            None if self.endpoint_inner.locator.is_some() => None,
+            None => match self.endpoint_inner.transport_layer.outbound.as_ref() {
+                Some(outbound) => outbound.r#type,
+                None => {
+                    let route = self.route_set.lock().first().cloned();
+                    match route {
+                        Some(route) => route
+                            .typed()
+                            .ok()
+                            .and_then(|route| route.uri.transport().cloned()),
+                        None => self.remote_uri.lock().transport().cloned(),
+                    }
+                }
+            },
+        }
+        .filter(|t| *t != crate::sip::Transport::Udp)?;
+
+        self.endpoint_inner
+            .transport_layer
+            .get_addrs()
+            .into_iter()
+            .find(|a| a.r#type == Some(transport))
     }
 
     pub(super) fn make_response(
@@ -1149,6 +1190,34 @@ impl DialogInner {
                     "no usable connection, retrying via recorded flow address"
                 );
                 tx.destination = Some(fallback_addr.clone());
+                // The dial-back can leave on another transport than the one
+                // the Via was built for; keep the Via matching it.
+                let transport = fallback_addr.r#type.unwrap_or_default();
+                let listener = self
+                    .endpoint_inner
+                    .transport_layer
+                    .get_addrs()
+                    .into_iter()
+                    .find(|a| a.r#type.unwrap_or_default() == transport);
+                let branch = tx
+                    .original
+                    .top_via_header()
+                    .and_then(|via| via.typed())
+                    .ok()
+                    .filter(|via| via.transport != transport)
+                    .and_then(|via| {
+                        via.params
+                            .into_iter()
+                            .find(|p| matches!(p, Param::Branch(_)))
+                    });
+                if let (Some(listener), Some(branch)) = (listener, branch) {
+                    if let (Ok(new_via), Ok(via)) = (
+                        self.endpoint_inner.get_via(Some(listener), Some(branch)),
+                        tx.original.via_header_mut(),
+                    ) {
+                        via.update_first_value(|_| Ok(new_via.into())).ok();
+                    }
+                }
                 if let Err(e) = tx.send().await {
                     warn!(
                         id = self.id.lock().to_string(),
@@ -1183,7 +1252,17 @@ impl DialogInner {
                         if method == Method::Invite {
                             self.handle_provisional_response(&resp).await?;
                         }
-                        self.transition(DialogState::Early(self.id.lock().clone(), resp))?;
+                        // RFC 3261 §12: a dialog moves from early to confirmed
+                        // and never back. A 1xx to a mid-dialog request (re-INVITE,
+                        // UPDATE, ...) must not regress an established dialog to
+                        // Early, or BYE is refused and hangup() tries to CANCEL.
+                        // The provisional is still notified so the caller sees it.
+                        let state = DialogState::Early(self.id.lock().clone(), resp);
+                        if self.can_cancel() {
+                            self.transition(state)?;
+                        } else {
+                            self.state_sender.send(state).ok();
+                        }
                         continue;
                     }
 
@@ -1372,6 +1451,7 @@ impl DialogInner {
             session_id: Mutex::new(snapshot.session_id),
             supports_100rel: snapshot.supports_100rel,
             remote_reliable: Mutex::new(None),
+            remote_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
         }))
@@ -1449,18 +1529,20 @@ impl DialogInner {
         }
     }
     pub(super) fn transition(&self, state: DialogState) -> Result<()> {
-        // Try to send state update, but don't fail if channel is closed
-        self.state_sender.send(state.clone()).ok();
-
         match state {
             DialogState::Updated(_, _, _)
             | DialogState::Notify(_, _, _)
             | DialogState::Info(_, _, _)
             | DialogState::Options(_, _, _) => {
+                // Try to send state update, but don't fail if channel is closed
+                self.state_sender.send(state).ok();
                 return Ok(());
             }
             _ => {}
         }
+        // Notify only transitions that are actually applied, and do it while
+        // holding the state lock so notifications follow the order in which
+        // the state changed.
         let mut old_state = self.state.lock();
         match (&*old_state, &state) {
             (DialogState::Terminated(id, _), _) => {
@@ -1478,7 +1560,9 @@ impl DialogInner {
             _ => {}
         }
         debug!(from = %old_state, to = %state, "transitioning state");
-        *old_state = state;
+        *old_state = state.clone();
+        // Try to send state update, but don't fail if channel is closed
+        self.state_sender.send(state).ok();
         Ok(())
     }
 

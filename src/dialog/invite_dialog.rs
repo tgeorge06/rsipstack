@@ -59,6 +59,19 @@ impl InviteDialog {
         &self.inner.cancel_token
     }
 
+    /// The most recent ACK received for an INVITE or re-INVITE this dialog
+    /// answered, or `None` if none has been received yet.
+    ///
+    /// When the INVITE or re-INVITE carried no offer, the offer goes in the
+    /// 2xx and the answer comes back in the ACK body (RFC 3261 §13.2.1,
+    /// §14.2). The ACK is recorded before the `Confirmed` state it causes is
+    /// notified. `Confirmed` is also notified after other mid-dialog
+    /// requests, so match the ACK's CSeq against the INVITE it should
+    /// acknowledge.
+    pub fn last_remote_ack(&self) -> Option<Request> {
+        self.inner.remote_ack.lock().clone()
+    }
+
     /// The initial INVITE request that created this dialog.
     pub fn initial_request(&self) -> Request {
         self.inner.initial_request.lock().clone()
@@ -195,6 +208,11 @@ impl InviteDialog {
         {
             return Ok(());
         }
+        self.send_cancel().await
+    }
+
+    /// Send the CANCEL for the initial INVITE, whatever the dialog state.
+    pub(super) async fn send_cancel(&self) -> Result<()> {
         debug!(id = %self.id(), "sending cancel request");
         let mut cancel_request = self.inner.initial_request.lock().clone();
         let invite_seq = cancel_request.cseq_header()?.seq()?;
@@ -303,12 +321,15 @@ impl InviteDialog {
                             }
                             continue;
                         } else {
-                            debug!(id = %self.id(), "received 407 response without auth option");
+                            // No credential to retry with: the challenge is the
+                            // final response (RFC 3261 §22.2, §22.3).
+                            final_response = Some(resp);
+                            debug!(id = %self.id(), ?status, "received auth challenge without credential");
                             self.inner.transition(DialogState::Terminated(
                                 self.id(),
                                 TerminatedReason::ProxyAuthRequired,
                             ))?;
-                            continue;
+                            break;
                         }
                     }
                     final_response = Some(resp.clone());
@@ -330,18 +351,7 @@ impl InviteDialog {
                             self.inner.update_route_set_from_response(&resp);
                         }
                         StatusCode::OK => {
-                            self.inner.update_route_set_from_response(&resp);
-                            let contact = resp.contact_header()?;
-                            self.inner.remote_contact.lock().replace(contact.clone());
-
-                            let contact_uri = resp
-                                .typed_contact_headers()?
-                                .first()
-                                .map(|c| c.uri.clone())
-                                .ok_or_else(|| {
-                                    crate::Error::Error("missing Contact header".to_string())
-                                })?;
-                            *self.inner.remote_uri.lock() = contact_uri;
+                            self.update_remote_target_from_2xx(&resp)?;
                             self.inner
                                 .transition(DialogState::Confirmed(dialog_id.clone(), resp))?;
                         }
@@ -357,6 +367,38 @@ impl InviteDialog {
             }
         }
         Ok((dialog_id, final_response))
+    }
+
+    /// Take the route set, Contact and remote target from a 2xx to the INVITE.
+    fn update_remote_target_from_2xx(&self, resp: &Response) -> Result<()> {
+        self.inner.update_route_set_from_response(resp);
+        let contact = resp.contact_header()?;
+        self.inner.remote_contact.lock().replace(contact.clone());
+
+        let contact_uri = resp
+            .typed_contact_headers()?
+            .first()
+            .map(|c| c.uri.clone())
+            .ok_or_else(|| crate::Error::Error("missing Contact header".to_string()))?;
+        *self.inner.remote_uri.lock() = contact_uri;
+        Ok(())
+    }
+
+    /// End the session a 2xx established after we cancelled the INVITE.
+    ///
+    /// A CANCEL that crosses a 2xx has no effect on the INVITE (RFC 3261
+    /// §9.1, §15), so the UAC has to send a BYE once the 2xx is ACKed. The
+    /// dialog was already abandoned, so no `Confirmed` state is reported.
+    pub(super) async fn bye_2xx_after_cancel(&self, resp: &Response) -> Result<()> {
+        if let Some(tag) = resp.to_header()?.tag()? {
+            self.inner.update_remote_tag(tag.value())?;
+        }
+        self.update_remote_target_from_2xx(resp)?;
+        let request = self
+            .inner
+            .make_request(Method::Bye, None, None, None, None, None)?;
+        self.inner.do_request(request).await?;
+        Ok(())
     }
 
     // ── Shared request semantics ──────────────────────────────────────────
@@ -808,6 +850,7 @@ impl InviteDialog {
             if let SipMessage::Request(req) = msg {
                 if req.method == Method::Ack {
                     debug!(id = %self.id(), "received ack for re-invite {}", req.uri);
+                    self.inner.remote_ack.lock().replace(req);
                     self.inner.transition(DialogState::Confirmed(
                         self.id(),
                         tx.last_response.clone().unwrap_or_default(),
@@ -840,6 +883,7 @@ impl InviteDialog {
                                 break;
                             }
                             debug!(id = %self.id(), "received ack {}", req.uri);
+                            self.inner.remote_ack.lock().replace(req);
                             self.inner.transition(DialogState::Confirmed(
                                 self.id(),
                                 tx.last_response.clone().unwrap_or_default(),
