@@ -1558,11 +1558,13 @@ impl DialogInner {
         }
     }
     pub(super) fn transition(&self, state: DialogState) -> Result<()> {
+        // In-dialog request events do not change the established lifecycle state.
         match state {
             DialogState::Updated(_, _, _)
             | DialogState::Notify(_, _, _)
             | DialogState::Info(_, _, _)
-            | DialogState::Options(_, _, _) => {
+            | DialogState::Options(_, _, _)
+            | DialogState::Refer(_, _, _) => {
                 // Try to send state update, but don't fail if channel is closed
                 self.state_sender.send(state).ok();
                 return Ok(());
