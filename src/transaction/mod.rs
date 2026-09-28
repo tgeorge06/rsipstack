@@ -21,13 +21,17 @@ pub const DEFAULT_CALLID_SUFFIX: &str = "restsend.com";
 
 /// Format used when generating a new Call-ID (dialog identifier).
 ///
-/// * `UuidWithSuffix` - `lower(uuid)@suffix`, e.g. `0b9e6c1e-1b40-4e8f-9c21-2f5a8d3e7b61@restsend.com` (default)
-/// * `Uuid` - plain lower-case UUID v4, e.g. `0b9e6c1e-1b40-4e8f-9c21-2f5a8d3e7b61`
+/// * `UuidWithSuffix` - `lower(uuid)@suffix` (32 hex digits, no dashes), e.g.
+///   `0b9e6c1e1b404e8f9c212f5a8d3e7b61@restsend.com` (default)
+/// * `Uuid` - plain lower-case UUID v4 (32 hex digits, no dashes)
+/// * `Random22` - 22 random ASCII alphanumerics (mixed case) `@suffix`, e.g.
+///   `aZ3kQ9mW1xP0bT7vR2cL5n@restsend.com`: the rsipstack 0.5.x shape
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CallIdFormat {
     #[default]
     UuidWithSuffix,
     Uuid,
+    Random22,
 }
 pub struct IncomingRequest {
     pub request: crate::sip::Request,
@@ -312,6 +316,12 @@ pub fn make_call_id(suffix: Option<&str>, format: CallIdFormat) -> crate::sip::h
         )
         .into(),
         CallIdFormat::Uuid => make_uuid_v4().into(),
+        CallIdFormat::Random22 => format!(
+            "{}@{}",
+            random_text(CALL_ID_LEN),
+            suffix.unwrap_or(DEFAULT_CALLID_SUFFIX)
+        )
+        .into(),
     }
 }
 
