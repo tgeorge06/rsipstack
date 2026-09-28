@@ -85,6 +85,16 @@ impl InviteDialog {
         self.inner.last_sent_ack.lock().clone()
     }
 
+    /// How the most recent re-INVITE this dialog answered ended: its
+    /// CSeq-correlated ACK (with the body a UAC puts there when our 2xx
+    /// carried the offer), or no ACK before the transaction ended. Taken
+    /// once; `None` when nothing is pending. Read it on the `Confirmed`
+    /// state that follows the re-INVITE and match its CSeq against the
+    /// `Confirmed` response's.
+    pub fn take_reinvite_ack(&self) -> Option<super::dialog::ReinviteAck> {
+        self.inner.reinvite_ack.lock().take()
+    }
+
     /// The initial INVITE request that created this dialog.
     pub fn initial_request(&self) -> Request {
         self.inner.initial_request.lock().clone()
@@ -851,26 +861,7 @@ impl InviteDialog {
             .transition(DialogState::Updated(self.id(), tx.original.clone(), handle))?;
 
         self.inner.process_transaction_handle(tx, rx).await?;
-        let answered_2xx = tx
-            .last_response
-            .as_ref()
-            .is_some_and(|resp| resp.status_code.kind() == StatusCodeKind::Successful);
-
-        while let Some(msg) = tx.receive().await {
-            if let SipMessage::Request(req) = msg {
-                if req.method == Method::Ack {
-                    debug!(id = %self.id(), "received ack for re-invite {}", req.uri);
-                    self.inner.remote_ack.lock().replace(req);
-                    self.inner.transition(DialogState::Confirmed(
-                        self.id(),
-                        tx.last_response.clone().unwrap_or_default(),
-                    ))?;
-                    break;
-                }
-            }
-        }
-        self.inner.end_session_without_ack(tx, answered_2xx).await;
-        Ok(())
+        self.inner.await_reinvite_ack(tx).await
     }
 
     async fn handle_invite(&mut self, tx: &mut Transaction) -> Result<()> {

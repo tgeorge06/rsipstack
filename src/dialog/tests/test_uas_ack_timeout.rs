@@ -1,8 +1,9 @@
 //! RFC 3261 §13.3.1.4: a UAS retransmits its 2xx to an INVITE (T1, doubling)
 //! until the ACK arrives. If no ACK arrives within 64*T1, the session SHOULD
-//! be ended with a BYE. The dialog must not stay in `WaitAck` forever.
+//! be ended with a BYE. The dialog must not stay in `WaitAck` forever. A
+//! re-INVITE's missing ACK is surfaced to the application instead.
 use crate::dialog::{
-    dialog::{Dialog, DialogState, DialogStateReceiver, TerminatedReason},
+    dialog::{Dialog, DialogState, DialogStateReceiver, ReinviteAck, TerminatedReason},
     dialog_layer::DialogLayer,
     invite_dialog::InviteDialog,
 };
@@ -180,29 +181,6 @@ fn is_invite_2xx(msg: &SipMessage) -> bool {
 fn is_2xx_to(msg: &SipMessage, cseq: u32) -> bool {
     is_invite_2xx(msg)
         && matches!(msg, SipMessage::Response(resp) if resp.cseq_header().unwrap().seq().unwrap() == cseq)
-}
-
-/// The BYE among `messages`: its arrival time, after checking it belongs to
-/// this dialog (Call-ID and both tags).
-fn bye_of_dialog(messages: &[(Instant, SipMessage)], local_tag: &str) -> Instant {
-    let (at, bye) = messages
-        .iter()
-        .find_map(|(at, m)| match m {
-            SipMessage::Request(req) if req.method == Method::Bye => Some((*at, req)),
-            _ => None,
-        })
-        .expect("the UAS must send a BYE when the ACK never arrives");
-    assert_eq!(bye.call_id_header().unwrap().value(), CALL_ID);
-    assert_eq!(
-        bye.from_header().unwrap().tag().unwrap().unwrap().value(),
-        local_tag,
-        "the BYE must come from the dialog's local tag"
-    );
-    assert_eq!(
-        bye.to_header().unwrap().tag().unwrap().unwrap().value(),
-        FROM_TAG
-    );
-    at
 }
 
 fn terminated_reason(states: &mut DialogStateReceiver) -> Option<TerminatedReason> {
@@ -420,10 +398,12 @@ async fn test_unacked_2xx_retransmission_interval_is_capped_at_t2() -> crate::Re
     Ok(())
 }
 
-/// The same applies to a re-INVITE: an established call whose re-INVITE 2xx
-/// is never ACKed is ended with a BYE (RFC 3261 §14.2 defers to §13.3.1.4).
+/// A re-INVITE is different: its 2xx is still retransmitted until 64*T1,
+/// but a missing ACK does not end the session. The dialog records
+/// `ReinviteAck::TimedOut` and notifies `Confirmed`, so the application can
+/// recover the negotiation (e.g. restore the previous offer/answer).
 #[tokio::test]
-async fn test_unacked_reinvite_2xx_ends_the_session() -> crate::Result<()> {
+async fn test_unacked_reinvite_2xx_is_surfaced_without_ending_the_session() -> crate::Result<()> {
     let token = CancellationToken::new();
     let (mut states, mut dialogs, peer) = setup(&token, short_timers()).await?;
 
@@ -488,15 +468,36 @@ async fn test_unacked_reinvite_2xx_ends_the_session() -> crate::Result<()> {
         oks.len()
     );
     assert!(
-        matches!(
-            terminated_reason(&mut states),
-            Some(TerminatedReason::Timeout)
-        ),
-        "a re-INVITE 2xx without ACK must terminate the dialog with Timeout, state {}",
-        dialog.state()
+        !messages.iter().any(|(_, m)| matches!(
+            m,
+            SipMessage::Request(req) if req.method == Method::Bye
+        )),
+        "a re-INVITE's missing ACK must not end the session"
     );
-    let bye_at = bye_of_dialog(&messages, &local_tag);
-    assert!(bye_at - answered >= T1X64 - T1);
+    let mut seen = Vec::new();
+    while let Ok(state) = states.try_recv() {
+        seen.push(state);
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|s| matches!(s, DialogState::Terminated(..))),
+        "the dialog must not terminate, got {seen:?}"
+    );
+    let confirmed_cseq = seen.iter().find_map(|s| match s {
+        DialogState::Confirmed(_, resp) => resp.cseq_header().ok()?.seq().ok(),
+        _ => None,
+    });
+    assert_eq!(
+        confirmed_cseq,
+        Some(2),
+        "the timed-out re-INVITE is surfaced with a Confirmed state, got {seen:?}"
+    );
+    assert_eq!(
+        dialog.take_reinvite_ack(),
+        Some(ReinviteAck::TimedOut { cseq: 2 })
+    );
+    assert!(dialog.state().is_confirmed());
 
     token.cancel();
     Ok(())

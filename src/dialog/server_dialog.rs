@@ -125,6 +125,11 @@ impl ServerInviteDialog {
     /// Returns a reference to the initial INVITE request that created
     /// this dialog. This can be used to access the original request
     /// headers, body, and other information.
+    /// See [`InviteDialog::take_reinvite_ack`](crate::dialog::invite_dialog::InviteDialog::take_reinvite_ack).
+    pub fn take_reinvite_ack(&self) -> Option<super::dialog::ReinviteAck> {
+        self.inner.reinvite_ack.lock().take()
+    }
+
     pub fn initial_request(&self) -> Request {
         self.inner.initial_request.lock().clone()
     }
@@ -848,26 +853,7 @@ impl ServerInviteDialog {
             .transition(DialogState::Updated(self.id(), tx.original.clone(), handle))?;
 
         self.inner.process_transaction_handle(tx, rx).await?;
-        let answered_2xx = tx
-            .last_response
-            .as_ref()
-            .is_some_and(|resp| resp.status_code.kind() == crate::sip::StatusCodeKind::Successful);
-
-        while let Some(msg) = tx.receive().await {
-            if let SipMessage::Request(req) = msg {
-                if req.method == crate::sip::Method::Ack {
-                    debug!(id = %self.id(),"received ack for re-invite {}", req.uri);
-                    self.inner.remote_ack.lock().replace(req);
-                    self.inner.transition(DialogState::Confirmed(
-                        self.id(),
-                        tx.last_response.clone().unwrap_or_default(),
-                    ))?;
-                    break;
-                }
-            }
-        }
-        self.inner.end_session_without_ack(tx, answered_2xx).await;
-        Ok(())
+        self.inner.await_reinvite_ack(tx).await
     }
 
     async fn handle_invite(&mut self, tx: &mut Transaction) -> Result<()> {
