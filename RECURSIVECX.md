@@ -64,26 +64,47 @@ too.
   `DialogInner.reinvite_ack`, `DialogInner::await_reinvite_ack` (`src/dialog/dialog.rs`),
   and `InviteDialog::take_reinvite_ack()` (also on the deprecated `ServerInviteDialog`).
   `InviteDialog::last_remote_ack()` (fork PR #8) is kept and still updated.
-- **What:** an ACK is accepted only when its CSeq equals the re-INVITE's.
-  `Received` is stored before `Confirmed` is notified. When a 2xx is never
-  ACKed, `TimedOut` is stored and `Confirmed` is notified. The session is
-  not ended.
+- **What:** an ACK is accepted only when its CSeq equals the re-INVITE's; a
+  stale or mismatched ACK is ignored and the wait goes on. `Received` is
+  stored before `Confirmed` is notified.
+- **No ACK within 64*T1: the session ends (RFC 3261 §13.3.1.4, applied to
+  re-INVITEs by §14.2).** The re-INVITE takes the same path as an initial
+  INVITE (`DialogInner::end_session_without_ack`, fork PR #11), on UAS and
+  UAC dialogs alike:
+  1. `ReinviteAck::TimedOut { cseq }` is stored, so a consumer can tell why.
+  2. `Terminated(Timeout)` is notified.
+  3. A BYE is sent. It is built before the notification and sent after it,
+     so `Terminated` does not wait for the BYE's response.
+
+  **No `Confirmed` is notified** for the timed-out re-INVITE. The dialog was
+  confirmed before and stays so until it terminates, but consumers read a
+  `Confirmed` after a re-INVITE as a finished renegotiation, and this one
+  never finished.
 - **Diverges:**
-  - Fork PR #11 had re-INVITEs end with `Terminated(Timeout)` + BYE. That is
-    removed. The initial INVITE keeps it.
-  - `TimedOut` now actually fires, about 64*T1 (32 s) after the 2xx. The fork
-    retransmits the 2xx until 64*T1 (Timer K on a server INVITE is gone), and
-    the final response is read before the wait. In the vendor, the
-    transaction ended at T4 (5 s) and `cleanup` had already dropped
-    `last_response`, so `TimedOut` was effectively unreachable.
-  - The unified handler also runs for client-role dialogs. A callee's
-    re-INVITE to rcx now notifies `Confirmed` after its ACK; the vendor's
-    `ClientInviteDialog` notified nothing.
-- **rcx:** `sip_session/dialog_events.rs` (`Confirmed` arm → `take_reinvite_ack`),
-  `sip_session/caller_reoffer.rs` `settle_caller_reoffer`,
+  - From 0.5.16 and from rcx PR #769, which kept the call up on `TimedOut`.
+    The vendor's `TimedOut` was effectively unreachable anyway: its server
+    INVITE transaction ended at T4 (5 s), and `cleanup` had already dropped
+    `last_response`. In the fork, the 2xx is retransmitted (T1 doubling,
+    capped at T2) until 64*T1, about 32 s, and then the call is torn down.
+    rcx's "restore the previous negotiation on `TimedOut`" branch in
+    `settle_caller_reoffer` no longer runs for a timeout; `Terminated(Timeout)`
+    follows instead.
+  - The unified handler also runs for client-role dialogs (and the
+    deprecated `ClientInviteDialog`'s now shares it). A callee's re-INVITE to
+    rcx notifies `Confirmed` after its ACK, or ends the call when no ACK
+    comes. The vendor's `ClientInviteDialog` did neither.
+- **rcx:** `sip_session/dialog_events.rs` (`Confirmed` arm → `take_reinvite_ack`;
+  `Terminated` arm), `sip_session/caller_reoffer.rs` `settle_caller_reoffer`,
   `renegotiation_tests.rs`, `queue_external_ring_accept_e2e_test`.
-- **Tests:** `test_ack_answer`, `test_uas_ack_timeout::test_unacked_reinvite_2xx_is_surfaced_without_ending_the_session`,
-  `test_late_reinvite_ack`.
+- **Tests:**
+  - `test_ack_answer`
+  - `test_late_reinvite_ack`
+  - `test_uas_ack_timeout`:
+    - `test_unacked_reinvite_2xx_ends_the_session` (UAS)
+    - `test_unacked_reinvite_2xx_ends_the_session_on_a_uac_dialog`
+    - `test_mismatched_ack_does_not_stop_the_reinvite_teardown`
+    - `test_acked_reinvite_keeps_the_call_up`
+    - `test_2xx_retransmission_interval_doubles_up_to_t2`
 
 ## 5. Client-side 2xx ACK body and last-sent ACK (rcx PR #769): carried
 
@@ -240,8 +261,10 @@ rcx depends on, so the 0.5.16 behavior was put back on this branch.
 ## Other fork behavior rcx will observe (not vendored patches)
 
 - A server INVITE 2xx is retransmitted until 64*T1 (Timer K removed for
-  that case, fork PR #11). An initial INVITE whose 2xx is never ACKed ends
-  with `Terminated(Timeout)` + BYE.
+  that case, fork PR #11). Following RFC 3261 §13.3.1.4, an INVITE whose 2xx
+  is never ACKed ends with `Terminated(Timeout)` + BYE. That covers the
+  initial INVITE and, since `fix/rfc3261-reinvite-ack-timeout`, a re-INVITE
+  on either role (see patch 4). The call is no longer kept up.
 - `Response` has two new public fields. Struct literals must set
   `synthetic: false, received_from: None` (rcx's tests already do).
 - `Dialog::ClientInvite` / `Dialog::ServerInvite` are now `Dialog::Invite(InviteDialog)`.

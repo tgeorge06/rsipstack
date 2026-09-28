@@ -674,19 +674,8 @@ impl ClientInviteDialog {
             .transition(DialogState::Updated(self.id(), tx.original.clone(), handle))?;
 
         self.inner.process_transaction_handle(tx, rx).await?;
-
-        // wait for ACK
-        while let Some(msg) = tx.receive().await {
-            match msg {
-                SipMessage::Request(req) if req.method == crate::sip::Method::Ack => {
-                    debug!(id = %self.id(), "received ACK for re-INVITE");
-                    self.inner.remote_ack.lock().replace(req);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        Ok(())
+        // Same ACK wait and RFC 3261 §13.3.1.4 timeout as `InviteDialog`.
+        self.inner.await_reinvite_ack(tx).await
     }
 
     async fn handle_refer(&mut self, tx: &mut Transaction) -> Result<()> {
