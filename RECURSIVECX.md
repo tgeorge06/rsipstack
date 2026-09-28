@@ -195,6 +195,48 @@ too.
 - **rcx:** `sip_session/dialog_events.rs` (`ProxyAuthRequired`).
 - **Test:** `dialog::tests::test_invite_auth_challenge`.
 
+## Fork behavior restored to match 0.5.16
+
+These are not vendored patches. The fork had diverged from 0.5.16 in ways
+rcx depends on, so the 0.5.16 behavior was put back on this branch.
+
+- **Raw SIP logging at DEBUG only.** UDP, stream and WebSocket raw
+  send/receive logs (and the UDP Via-update failure dump) had moved to INFO;
+  they are DEBUG again. Two WARN logs that carried a whole message (a
+  WebSocket parse failure, the dialog layer's "failed to send request") now
+  log only the length or the method at WARN, and the message at DEBUG. That
+  is stricter than 0.5.16, which logged both at WARN. Test:
+  `transport::tests::test_raw_message_log_level`.
+- **Role-typed layer lookups.**
+  - `DialogLayer::get_client_dialog_by_call_id` returns UAC dialogs only.
+    With the unified `Dialog::Invite` it had also returned the inbound
+    (UAS) leg of a transparent-Call-ID call, so a caller could BYE or send
+    INFO on the caller's dialog.
+  - `get_or_create_server_invite` matches existing UAS dialogs only.
+  - `get_dialog`, `match_dialog`, `take_dialog` and `remove_dialog` were
+    role-agnostic in 0.5.16 too.
+  - rcx callers: `rwi/processor/originate.rs` (Hangup arm, media timeout,
+    transfer, DTMF).
+  - Test: `dialog_layer::test_lookups_keep_uac_and_uas_dialogs_apart`.
+- **BYE lifecycle** (`DialogInner::send_bye`, used by `InviteDialog` and
+  both deprecated wrappers).
+  - A UAS notifies `Terminated(UasBye)` before sending the BYE and returns
+    the send result.
+  - A UAC notifies `Terminated(UacBye)` after the BYE transaction, whatever
+    its outcome (a failed send is logged, `Ok` returned).
+  - Before this, `Terminated` waited for a successful BYE transaction.
+  - Still diverges (upstream 0.6.x): `bye()` on a dialog that is not
+    confirmed (a UAS may also be in `WaitAck`) and not terminated returns
+    `Err`, where 0.5.16 returned `Ok(())` silently.
+  - rcx: the `Terminated` arms that empty the callee dialogs and finish
+    shutdown (`sip_session/dialog_events.rs`).
+  - Test: `dialog::tests::test_bye_lifecycle`.
+- **Call-ID shape.** `CallIdFormat::Random22` (`EndpointOption::callid_format`)
+  generates the 0.5.x Call-ID exactly: 22 random mixed-case ASCII
+  alphanumerics, `@`, then `callid_suffix` (default `restsend.com`). The
+  fork's default is `UuidWithSuffix` (32 hex digits). rcx sets `Random22`
+  explicitly.
+
 ## Other fork behavior rcx will observe (not vendored patches)
 
 - A server INVITE 2xx is retransmitted until 64*T1 (Timer K removed for
