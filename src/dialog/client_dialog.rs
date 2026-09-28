@@ -821,19 +821,7 @@ impl ClientInviteDialog {
                             self.inner.update_route_set_from_response(&resp);
                         }
                         StatusCode::OK => {
-                            self.inner.update_route_set_from_response(&resp);
-                            // 200 response to INVITE always contains Contact header
-                            let contact = resp.contact_header()?;
-                            self.inner.remote_contact.lock().replace(contact.clone());
-
-                            let contact_uri = resp
-                                .typed_contact_headers()?
-                                .first()
-                                .map(|c| c.uri.clone())
-                                .ok_or_else(|| {
-                                    crate::Error::Error("missing Contact header".to_string())
-                                })?;
-                            *self.inner.remote_uri.lock() = contact_uri;
+                            self.inner.adopt_2xx_remote_target(&resp)?;
                             self.inner
                                 .transition(DialogState::Confirmed(dialog_id.clone(), resp))?;
                         }

@@ -400,19 +400,11 @@ impl InviteDialog {
         Ok((dialog_id, final_response))
     }
 
-    /// Take the route set, Contact and remote target from a 2xx to the INVITE.
+    /// Take the route set, Contact and remote target from a 2xx to the
+    /// INVITE, keeping an established `;transport=` (see
+    /// `DialogInner::adopt_2xx_remote_target`).
     fn update_remote_target_from_2xx(&self, resp: &Response) -> Result<()> {
-        self.inner.update_route_set_from_response(resp);
-        let contact = resp.contact_header()?;
-        self.inner.remote_contact.lock().replace(contact.clone());
-
-        let contact_uri = resp
-            .typed_contact_headers()?
-            .first()
-            .map(|c| c.uri.clone())
-            .ok_or_else(|| crate::Error::Error("missing Contact header".to_string()))?;
-        *self.inner.remote_uri.lock() = contact_uri;
-        Ok(())
+        self.inner.adopt_2xx_remote_target(resp)
     }
 
     /// End the session a 2xx established after we cancelled the INVITE.

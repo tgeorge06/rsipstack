@@ -806,6 +806,43 @@ impl DialogInner {
     /// the dialog (RFC 3261 §12.1.2). Persisting it here ensures all subsequent
     /// in-dialog requests reuse the same proxy chain instead of targeting the
     /// remote contact directly.
+    /// Take the route set, Contact and remote target from a 2xx to the
+    /// INVITE (RFC 3261 §12.1.2).
+    ///
+    /// Sticky transport: when the established remote target carries a
+    /// `;transport=` parameter and the 2xx Contact names none, the parameter
+    /// is carried over onto the adopted target (a `sips` Contact keeps TLS
+    /// through its scheme). In-dialog requests (BYE, re-INVITE, UPDATE)
+    /// resolve their connection from the remote target, so adopting a bare
+    /// Contact would silently move a TCP call's mid-dialog requests to UDP.
+    pub(super) fn adopt_2xx_remote_target(&self, resp: &Response) -> Result<()> {
+        self.update_route_set_from_response(resp);
+        let contact = resp.contact_header()?;
+        self.remote_contact.lock().replace(contact.clone());
+
+        let mut contact_uri = resp
+            .typed_contact_headers()?
+            .first()
+            .map(|c| c.uri.clone())
+            .ok_or_else(|| crate::Error::Error("missing Contact header".to_string()))?;
+        let mut remote_uri = self.remote_uri.lock();
+        let established_transport = remote_uri.params.iter().find_map(|p| match p {
+            Param::Transport(t) => Some(*t),
+            _ => None,
+        });
+        if let Some(transport) = established_transport {
+            let has_transport = contact_uri
+                .params
+                .iter()
+                .any(|p| matches!(p, Param::Transport(_)));
+            if !has_transport && contact_uri.scheme != Some(crate::sip::Scheme::Sips) {
+                contact_uri.params.push(Param::Transport(transport));
+            }
+        }
+        *remote_uri = contact_uri;
+        Ok(())
+    }
+
     pub(crate) fn update_route_set_from_response(&self, resp: &Response) {
         if !matches!(self.role, TransactionRole::Client) {
             return;
