@@ -1324,12 +1324,11 @@ impl DialogInner {
                         // and never back. A 1xx to a mid-dialog request (re-INVITE,
                         // UPDATE, ...) must not regress an established dialog to
                         // Early, or BYE is refused and hangup() tries to CANCEL.
-                        // The provisional is still notified so the caller sees it.
-                        let state = DialogState::Early(self.id.lock().clone(), resp);
+                        // Nor is it notified: subscribers treat `Early` as the
+                        // dialog's early state (ringing), not as a provisional
+                        // to a later transaction.
                         if self.can_cancel() {
-                            self.transition(state)?;
-                        } else {
-                            self.state_sender.send(state).ok();
+                            self.transition(DialogState::Early(self.id.lock().clone(), resp))?;
                         }
                         continue;
                     }

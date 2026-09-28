@@ -181,15 +181,12 @@ async fn assert_provisional_keeps_confirmed(method: Method) -> crate::Result<()>
         "dialog must be Confirmed after the in-dialog {method} completes, state: {}",
         dialog.state()
     );
-    // The 183 is still delivered to the caller, it just does not change the
-    // dialog's state.
+    // The 183 neither changes the dialog's state nor is notified as `Early`:
+    // subscribers read `Early` as the dialog's own early state.
     let states = drain_states(&mut states);
     assert!(
-        states.iter().any(|s| matches!(
-            s,
-            DialogState::Early(_, r) if r.status_code == crate::sip::StatusCode::SessionProgress
-        )),
-        "the 183 to an in-dialog {method} must still be notified, got {states:?}"
+        !states.iter().any(|s| matches!(s, DialogState::Early(_, _))),
+        "a 183 to an in-dialog {method} must not be notified as Early, got {states:?}"
     );
 
     // The call can still be hung up with a BYE.
