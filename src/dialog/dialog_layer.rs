@@ -514,6 +514,20 @@ impl DialogLayer {
         }
     }
 
+    /// Remove the dialog and return it, in one map operation.
+    ///
+    /// When several tasks may end the same dialog, each doing `get_dialog`
+    /// then `remove_dialog` lets two of them hold it and both send a BYE.
+    /// `take_dialog` gives the dialog to exactly one caller, which then owns
+    /// its teardown. Like `remove_dialog`, the dialog's cancel token is
+    /// cancelled.
+    pub fn take_dialog(&self, id: &DialogId) -> Option<Dialog> {
+        self.inner.dialogs.remove(&id.to_string()).map(|(_, d)| {
+            d.on_remove();
+            d
+        })
+    }
+
     pub fn match_dialog(&self, tx: &Transaction) -> Option<Dialog> {
         let id = DialogId::try_from(tx).ok()?;
         self.get_dialog(&id)

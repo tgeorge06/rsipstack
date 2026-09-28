@@ -263,6 +263,54 @@ async fn test_dialog_removal() -> crate::Result<()> {
     Ok(())
 }
 
+/// `take_dialog` removes and returns the dialog in one operation: of several
+/// concurrent takers, exactly one gets it.
+#[tokio::test]
+async fn test_take_dialog_hands_the_dialog_to_exactly_one_caller() -> crate::Result<()> {
+    let endpoint = create_test_endpoint().await?;
+    let dialog_layer = std::sync::Arc::new(DialogLayer::new(endpoint.inner.clone()));
+    let mock_conn = create_mock_connection().await?;
+
+    let invite_req = create_invite_request("alice-tag-take", "", "call-id-take", "z9hG4bKtake");
+    let key = TransactionKey::from_request(&invite_req, TransactionRole::Server)?;
+    let tx = Transaction::new_server(key, invite_req, endpoint.inner.clone(), Some(mock_conn));
+    let (state_sender, _) = unbounded_channel();
+    let dialog = dialog_layer.get_or_create_server_invite(
+        &tx,
+        state_sender,
+        None,
+        Some(crate::sip::Uri::try_from("sip:bob@bob.example.com:5060")?),
+    )?;
+    let dialog_id = dialog.id();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let takers: Vec<_> = (0..8)
+        .map(|_| {
+            let layer = dialog_layer.clone();
+            let id = dialog_id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                layer.take_dialog(&id)
+            })
+        })
+        .collect();
+    let taken: Vec<_> = takers
+        .into_iter()
+        .filter_map(|t| t.join().expect("taker panicked"))
+        .collect();
+
+    assert_eq!(taken.len(), 1, "exactly one caller takes the dialog");
+    assert_eq!(taken[0].id(), dialog_id);
+    assert!(
+        dialog.cancel_token().is_cancelled(),
+        "a taken dialog is removed like remove_dialog removes it"
+    );
+    assert_eq!(dialog_layer.len(), 0);
+    assert!(dialog_layer.take_dialog(&dialog_id).is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_dialog_layer_with_swapped_tags() -> crate::Result<()> {
     let endpoint = create_test_endpoint().await?;
