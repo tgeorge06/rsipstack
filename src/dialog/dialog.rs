@@ -810,8 +810,8 @@ impl DialogInner {
     /// INVITE (RFC 3261 §12.1.2).
     ///
     /// Sticky transport: when the established remote target carries a
-    /// `;transport=` parameter and the 2xx Contact names none, the parameter
-    /// is carried over onto the adopted target (a `sips` Contact keeps TLS
+    /// non-UDP `;transport=` parameter and the 2xx Contact names none, the
+    /// parameter is carried over onto the adopted target (a `sips` Contact keeps TLS
     /// through its scheme). In-dialog requests (BYE, re-INVITE, UPDATE)
     /// resolve their connection from the remote target, so adopting a bare
     /// Contact would silently move a TCP call's mid-dialog requests to UDP.
@@ -827,7 +827,7 @@ impl DialogInner {
             .ok_or_else(|| crate::Error::Error("missing Contact header".to_string()))?;
         let mut remote_uri = self.remote_uri.lock();
         let established_transport = remote_uri.params.iter().find_map(|p| match p {
-            Param::Transport(t) => Some(*t),
+            Param::Transport(t) if *t != crate::sip::Transport::Udp => Some(*t),
             _ => None,
         });
         if let Some(transport) = established_transport {

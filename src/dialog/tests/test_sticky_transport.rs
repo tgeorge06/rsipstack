@@ -101,8 +101,17 @@ fn test_2xx_contact_transport_and_sips_scheme_win() -> crate::Result<()> {
 
 #[test]
 fn test_2xx_contact_without_transport_stays_bare_on_udp() -> crate::Result<()> {
-    let inner = client_dialog("sip:bob@192.0.2.10:5060")?;
-    inner.adopt_2xx_remote_target(&ok_with_contact("sip:bob@192.0.2.20:5070")?)?;
-    assert_eq!(transport_of(&inner.remote_uri.lock()), None);
+    for target in [
+        "sip:bob@192.0.2.10:5060",
+        "sip:bob@192.0.2.10:5060;transport=udp",
+    ] {
+        let inner = client_dialog(target)?;
+        inner.adopt_2xx_remote_target(&ok_with_contact("sip:bob@192.0.2.20:5070")?)?;
+        assert_eq!(
+            transport_of(&inner.remote_uri.lock()),
+            None,
+            "UDP is the default, nothing to carry over from {target}"
+        );
+    }
     Ok(())
 }
