@@ -726,9 +726,17 @@ impl ClientInviteDialog {
         &self,
         tx: &mut Transaction,
     ) -> Result<(DialogId, Option<Response>)> {
-        self.inner.transition(DialogState::Calling(self.id()))?;
         let mut auth_sent = false;
         tx.send().await?;
+        // `Calling` is the "INVITE is on the wire" signal: notified only
+        // once the transport write returned Ok. A send that found no
+        // connection (Timer A retries it) or whose write failed notifies
+        // nothing; later responses notify `Trying` / `Early` as usual. The
+        // stored state is `Calling` from construction, so only the
+        // notification moves.
+        if tx.request_written() {
+            self.inner.transition(DialogState::Calling(self.id()))?;
+        }
         let mut dialog_id = self.id();
         let mut final_response = None;
         while let Some(msg) = tx.receive().await {

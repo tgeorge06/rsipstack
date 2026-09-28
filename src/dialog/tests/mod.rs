@@ -1,5 +1,6 @@
 mod test_ack_answer;
 mod test_authenticate;
+mod test_calling_after_send;
 mod test_bye_after_peer_closed;
 mod test_cancel_2xx_race;
 mod test_client_dialog;

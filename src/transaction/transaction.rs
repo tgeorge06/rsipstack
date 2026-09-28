@@ -190,6 +190,10 @@ pub struct Transaction {
     pub timer_g: Option<u64>, // server invite only
     retransmission: bool,
     is_cleaned_up: bool,
+    /// Whether the last `send()` wrote the request to a connection. `send()`
+    /// returns `Ok` without writing when no connection could be found (Timer
+    /// A retries) or when a stream write failed (a local 503 follows).
+    request_written: bool,
 }
 
 impl Transaction {
@@ -232,6 +236,7 @@ impl Transaction {
             tu_receiver,
             tu_sender,
             is_cleaned_up: false,
+            request_written: false,
         };
         tx.endpoint_inner
             .attach_transaction(&tx.key, tx.tu_sender.clone());
@@ -329,10 +334,14 @@ impl Transaction {
         // so the transaction always enters the state machine (Calling) and
         // timers (Timer A / Timer B) handle retries and timeouts.
         let mut stream_failed = false;
+        self.request_written = false;
         if let Some(connection) = self.connection.as_ref() {
-            if let Err(e) = connection.send(message, self.destination.as_ref()).await {
-                warn!(key = %self.key, error = %e, "send failed");
-                stream_failed = connection.is_stream();
+            match connection.send(message, self.destination.as_ref()).await {
+                Ok(()) => self.request_written = true,
+                Err(e) => {
+                    warn!(key = %self.key, error = %e, "send failed");
+                    stream_failed = connection.is_stream();
+                }
             }
         } else {
             debug!(key = %self.key, "no connection, will retry on timer");
@@ -346,6 +355,12 @@ impl Transaction {
             self.on_stream_send_failure()?;
         }
         Ok(())
+    }
+
+    /// Whether the last [`send`](Self::send) actually wrote the request to a
+    /// connection (the transport write returned `Ok`).
+    pub fn request_written(&self) -> bool {
+        self.request_written
     }
 
     /// A write on a stream connection (TCP/TLS/WS) failed. Nothing will ever
