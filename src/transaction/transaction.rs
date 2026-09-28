@@ -1098,7 +1098,16 @@ impl Transaction {
                         "no connection found".to_string(),
                         self.key.clone(),
                     ))?;
-                    if !connection.is_reliable() {
+                    // RFC 3261 §13.3.1.4: the UAS core retransmits a 2xx on
+                    // every transport, reliable ones included (it can be lost
+                    // at a later UDP hop), until the ACK or 64*T1. A non-2xx
+                    // final is retransmitted on unreliable transports only
+                    // (§17.2.1).
+                    let answered_2xx = self
+                        .last_response
+                        .as_ref()
+                        .is_some_and(|r| r.status_code.kind() == StatusCodeKind::Successful);
+                    if answered_2xx || !connection.is_reliable() {
                         let timer_g = self.endpoint_inner.timers.timeout(
                             self.endpoint_inner.option.t1,
                             TransactionTimer::TimerG(
