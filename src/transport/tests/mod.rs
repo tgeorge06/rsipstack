@@ -1,4 +1,5 @@
 pub mod test_listener_api;
+pub mod test_raw_message_log_level;
 pub mod test_sipaddr;
 pub mod test_stream_encoding;
 pub mod test_tls_reload;

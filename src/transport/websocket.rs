@@ -295,7 +295,8 @@ impl StreamConnection for WebSocketConnection {
     async fn send_message(&self, msg: SipMessage) -> Result<()> {
         let data = msg.to_string();
         let mut sink = self.inner.ws_sink.lock().await;
-        info!(dest = %self.inner.remote_addr, raw_message = ?data, "websocket send");
+        // Raw messages carry credentials, numbers and SDP: DEBUG only.
+        debug!(dest = %self.inner.remote_addr, raw_message = ?data, "websocket send");
         sink.send(Message::Text(data.into())).await?;
         Ok(())
     }
@@ -320,7 +321,7 @@ impl StreamConnection for WebSocketConnection {
         while let Some(msg) = ws_read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    info!(src = %remote_addr, raw_message = ?text.as_str(), "websocket message received");
+                    debug!(src = %remote_addr, raw_message = ?text.as_str(), "websocket message received");
                     match SipMessage::try_from(text.as_str()) {
                         Ok(sip_msg) => {
                             let remote_socket_addr = remote_addr.get_socketaddr()?;
@@ -340,7 +341,8 @@ impl StreamConnection for WebSocketConnection {
                             }
                         }
                         Err(e) => {
-                            warn!(error = %e, src = %remote_addr, raw_message = ?text.as_str(), "Error parsing SIP message");
+                            warn!(error = %e, src = %remote_addr, len = text.len(), "Error parsing SIP message");
+                            debug!(src = %remote_addr, raw_message = ?text.as_str(), "unparsable SIP message");
                         }
                     }
                 }
