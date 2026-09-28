@@ -22,7 +22,7 @@ const PEER_TAG: &str = "peer-tag";
 
 /// Receive the next request with `method` on the raw peer socket, skipping
 /// anything else (retransmissions, ACKs we are not waiting for).
-async fn recv_request(socket: &UdpSocket, method: Method) -> (Request, SocketAddr) {
+pub(super) async fn recv_request(socket: &UdpSocket, method: Method) -> (Request, SocketAddr) {
     let mut buf = vec![0u8; 4096];
     loop {
         let (len, from) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
@@ -81,7 +81,7 @@ fn drain_states(rx: &mut DialogStateReceiver) -> Vec<DialogState> {
 
 /// Set up a UAC endpoint and a raw UDP peer, and establish a dialog whose
 /// initial INVITE is answered 100 → 183 → 200. Returns the confirmed dialog.
-async fn establish(
+pub(super) async fn establish(
     token: &CancellationToken,
 ) -> crate::Result<(InviteDialog, DialogStateReceiver, UdpSocket)> {
     let peer = UdpSocket::bind("127.0.0.1:0").await?;

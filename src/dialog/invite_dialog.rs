@@ -72,6 +72,19 @@ impl InviteDialog {
         self.inner.remote_ack.lock().clone()
     }
 
+    /// Arm the body the NEXT in-dialog INVITE's 2xx ACK carries: a UAC's
+    /// answer to an offer the 2xx brings, e.g. after an offerless re-INVITE
+    /// (RFC 3261 §14.2). Consumed by that one request; `None` disarms it.
+    pub fn set_next_ack_body(&self, body: Option<Vec<u8>>) {
+        *self.inner.next_ack_body.lock() = body;
+    }
+
+    /// The last 2xx ACK this dialog sent for an in-dialog INVITE (UAC role),
+    /// or `None` if none was sent yet.
+    pub fn last_sent_ack(&self) -> Option<Request> {
+        self.inner.last_sent_ack.lock().clone()
+    }
+
     /// The initial INVITE request that created this dialog.
     pub fn initial_request(&self) -> Request {
         self.inner.initial_request.lock().clone()

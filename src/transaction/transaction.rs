@@ -171,6 +171,15 @@ pub struct Transaction {
     pub connection: Option<SipConnection>,
     pub last_response: Option<Response>,
     pub last_ack: Option<Request>,
+    /// Body for the 2xx ACK this client INVITE transaction builds: a UAC's
+    /// answer to an offer the 2xx brought (RFC 3261 §14.2). Set by the dialog
+    /// layer (`DialogInner::send_dialog_request`) from what the application
+    /// armed with `set_next_ack_body`; consumed by `send_ack`.
+    pub ack_body: Option<Vec<u8>>,
+    /// The ACK this client INVITE transaction sent. `last_ack` is taken by
+    /// `cleanup` for the detached late-2xx retransmission, so the dialog
+    /// layer reads this one.
+    pub sent_ack: Option<Request>,
     pub tu_receiver: TransactionEventReceiver,
     pub tu_sender: TransactionEventSender,
     pub timer_a: Option<u64>,
@@ -211,6 +220,8 @@ impl Transaction {
             state,
             last_response: None,
             last_ack: None,
+            ack_body: None,
+            sent_ack: None,
             timer_a: None,
             timer_b: None,
             timer_c: None,
@@ -533,7 +544,7 @@ impl Transaction {
                 ));
             }
         }
-        let ack = match self.last_ack.clone() {
+        let mut ack = match self.last_ack.clone() {
             Some(ack) => ack,
             None => match self.last_response {
                 Some(ref resp) => self.endpoint_inner.make_ack(&self.original, resp)?,
@@ -545,6 +556,28 @@ impl Transaction {
                 }
             },
         };
+        // A 2xx ACK carries the armed body: the UAC's answer to the offer the
+        // 2xx brought (RFC 3261 §14.2).
+        if let Some(body) = self.ack_body.take() {
+            let is_2xx = self
+                .last_response
+                .as_ref()
+                .is_some_and(|resp| resp.status_code.kind() == StatusCodeKind::Successful);
+            if is_2xx && ack.body.is_empty() {
+                ack.headers.retain(|h| {
+                    !matches!(
+                        h,
+                        crate::sip::Header::ContentLength(_) | crate::sip::Header::ContentType(_)
+                    )
+                });
+                ack.headers
+                    .push(crate::sip::Header::ContentType("application/sdp".into()));
+                ack.headers.push(crate::sip::Header::ContentLength(
+                    (body.len() as u32).into(),
+                ));
+                ack.body = body;
+            }
+        }
 
         // Capture locator + transport lookup result
         // so before_send is called regardless of lookup outcome
@@ -603,7 +636,10 @@ impl Transaction {
         };
 
         match ack.clone() {
-            SipMessage::Request(ref ack_req) => self.last_ack.replace(ack_req.clone()),
+            SipMessage::Request(ref ack_req) => {
+                self.sent_ack = Some(ack_req.clone());
+                self.last_ack.replace(ack_req.clone())
+            }
             _ => None,
         };
 
@@ -819,7 +855,11 @@ impl Transaction {
         self.transition(new_state).ok();
 
         if is_completed_client_invite {
-            self.send_ack(connection).await.ok();
+            // A lost ACK is a dialog that never confirms (the far end
+            // retransmits its 2xx until its timer expires): leave a trace.
+            if let Err(e) = self.send_ack(connection).await {
+                warn!(key = %self.key, error = %e, "ACK for the final response could not be sent");
+            }
         }
 
         Some(SipMessage::Response(resp))

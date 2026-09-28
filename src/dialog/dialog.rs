@@ -335,6 +335,12 @@ pub struct DialogInner {
     /// The last ACK received for an INVITE or re-INVITE this dialog answered
     /// (UAS role). Carries the answer when the 2xx carried the offer.
     pub(super) remote_ack: Mutex<Option<Request>>,
+    /// UAC side: the body the NEXT in-dialog INVITE's 2xx ACK carries (the
+    /// answer to an offer in that 2xx, RFC 3261 §14.2), consumed by that one
+    /// request. Armed with `InviteDialog::set_next_ack_body`.
+    pub(super) next_ack_body: Mutex<Option<Vec<u8>>>,
+    /// UAC side: the last 2xx ACK this dialog sent for an in-dialog INVITE.
+    pub(super) last_sent_ack: Mutex<Option<Request>>,
     pub(super) server_connection: Mutex<Option<SipConnection>>,
     /// Structural source address of the flow that created this server dialog,
     /// captured at creation time from the connection itself (not parsed from
@@ -501,6 +507,8 @@ impl DialogInner {
             supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
+            next_ack_body: Mutex::new(None),
+            last_sent_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
         })
@@ -1130,6 +1138,11 @@ impl DialogInner {
             self.endpoint_inner.clone(),
             affinity_connection,
         );
+        // The transaction builds the 2xx ACK, so it gets the body armed on
+        // the dialog for this one INVITE (see `next_ack_body`).
+        if method == Method::Invite {
+            tx.ack_body = self.next_ack_body.lock().take();
+        }
 
         if let Some(route) = tx.original.route_header() {
             if let Ok(first_route) = route.typed() {
@@ -1290,7 +1303,9 @@ impl DialogInner {
                                 crate::sip::Method::Cancel => self.get_local_seq(),
                                 _ => self.increment_local_seq(),
                             };
+                            let ack_body = tx.ack_body.take();
                             tx = handle_client_authenticate(new_seq, &tx, resp, cred).await?;
+                            tx.ack_body = ack_body;
                             tx.send().await?;
                             continue;
                         } else {
@@ -1313,6 +1328,10 @@ impl DialogInner {
                     );
                     if !matches!(method, Method::PRack) {
                         self.clear_remote_reliable();
+                    }
+                    // Keep the 2xx ACK this INVITE sent (see `last_sent_ack`).
+                    if method == Method::Invite && tx.sent_ack.is_some() {
+                        *self.last_sent_ack.lock() = tx.sent_ack.clone();
                     }
                     return Ok(Some(resp));
                 }
@@ -1483,6 +1502,8 @@ impl DialogInner {
             supports_100rel: snapshot.supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
+            next_ack_body: Mutex::new(None),
+            last_sent_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
         }))

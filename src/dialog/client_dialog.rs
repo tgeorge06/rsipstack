@@ -316,6 +316,16 @@ impl ClientInviteDialog {
         self.inner.do_request(request).await
     }
 
+    /// See [`InviteDialog::set_next_ack_body`](crate::dialog::invite_dialog::InviteDialog::set_next_ack_body).
+    pub fn set_next_ack_body(&self, body: Option<Vec<u8>>) {
+        *self.inner.next_ack_body.lock() = body;
+    }
+
+    /// See [`InviteDialog::last_sent_ack`](crate::dialog::invite_dialog::InviteDialog::last_sent_ack).
+    pub fn last_sent_ack(&self) -> Option<crate::sip::Request> {
+        self.inner.last_sent_ack.lock().clone()
+    }
+
     /// Send an UPDATE request to modify session parameters
     ///
     /// Sends an UPDATE request within an established dialog to modify
