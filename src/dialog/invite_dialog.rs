@@ -288,16 +288,16 @@ impl InviteDialog {
         use super::authenticate::handle_client_authenticate;
 
         let mut auth_sent = false;
+        // `Calling` is the "INVITE is on the wire" signal: notified once, on
+        // the first successful transport write, whether that is this send or
+        // a Timer A retransmission after it found no connection. A send that
+        // never reaches the wire notifies nothing. The stored state is
+        // `Calling` from construction, so only the notification moves.
+        let (inner, id) = (self.inner.clone(), self.id());
+        tx.on_first_write(move || {
+            inner.transition(DialogState::Calling(id)).ok();
+        });
         tx.send().await?;
-        // `Calling` is the "INVITE is on the wire" signal: notified only
-        // once the transport write returned Ok. A send that found no
-        // connection (Timer A retries it) or whose write failed notifies
-        // nothing; later responses notify `Trying` / `Early` as usual. The
-        // stored state is `Calling` from construction, so only the
-        // notification moves.
-        if tx.request_written() {
-            self.inner.transition(DialogState::Calling(self.id()))?;
-        }
         // Record the flow the INVITE actually went out on, so later
         // in-dialog requests (BYE / re-INVITE / INFO) reuse it instead of
         // destination-routing off a possibly unroutable Contact.

@@ -190,10 +190,10 @@ pub struct Transaction {
     pub timer_g: Option<u64>, // server invite only
     retransmission: bool,
     is_cleaned_up: bool,
-    /// Whether the last `send()` wrote the request to a connection. `send()`
-    /// returns `Ok` without writing when no connection could be found (Timer
-    /// A retries) or when a stream write failed (a local 503 follows).
-    request_written: bool,
+    /// Called once, on the first successful transport write of the request,
+    /// whichever send makes it (`send()` or a Timer A retransmission). See
+    /// [`Transaction::on_first_write`].
+    first_write_hook: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl Transaction {
@@ -236,7 +236,7 @@ impl Transaction {
             tu_receiver,
             tu_sender,
             is_cleaned_up: false,
-            request_written: false,
+            first_write_hook: None,
         };
         tx.endpoint_inner
             .attach_transaction(&tx.key, tx.tu_sender.clone());
@@ -334,10 +334,10 @@ impl Transaction {
         // so the transaction always enters the state machine (Calling) and
         // timers (Timer A / Timer B) handle retries and timeouts.
         let mut stream_failed = false;
-        self.request_written = false;
+        let mut written = false;
         if let Some(connection) = self.connection.as_ref() {
             match connection.send(message, self.destination.as_ref()).await {
-                Ok(()) => self.request_written = true,
+                Ok(()) => written = true,
                 Err(e) => {
                     warn!(key = %self.key, error = %e, "send failed");
                     stream_failed = connection.is_stream();
@@ -351,16 +351,28 @@ impl Transaction {
         // even when transport is unavailable. Timer A will retry the send (and
         // redo the transport lookup if needed), and Timer B handles timeout.
         self.transition(TransactionState::Calling)?;
+        if written {
+            self.note_request_written();
+        }
         if stream_failed {
             self.on_stream_send_failure()?;
         }
         Ok(())
     }
 
-    /// Whether the last [`send`](Self::send) actually wrote the request to a
-    /// connection (the transport write returned `Ok`).
-    pub fn request_written(&self) -> bool {
-        self.request_written
+    /// Register `hook` to run once, on the first successful transport write
+    /// of the request: in [`send`](Self::send), or in a Timer A
+    /// retransmission when the first send found no connection or failed.
+    /// `send()` returns `Ok` without writing in those cases, so this is the
+    /// "request is on the wire" signal. Register it before `send()`.
+    pub fn on_first_write(&mut self, hook: impl FnOnce() + Send + Sync + 'static) {
+        self.first_write_hook = Some(Box::new(hook));
+    }
+
+    fn note_request_written(&mut self) {
+        if let Some(hook) = self.first_write_hook.take() {
+            hook();
+        }
     }
 
     /// A write on a stream connection (TCP/TLS/WS) failed. Nothing will ever
@@ -920,13 +932,16 @@ impl Transaction {
                             } else {
                                 self.original.to_owned().into()
                             };
-                            if let Err(e) = connection
+                            match connection
                                 .send(retry_message, self.destination.as_ref())
                                 .await
                             {
-                                warn!(key = %self.key, error = %e, "timer A resend failed");
-                                if connection.is_stream() {
-                                    return self.on_stream_send_failure();
+                                Ok(()) => self.note_request_written(),
+                                Err(e) => {
+                                    warn!(key = %self.key, error = %e, "timer A resend failed");
+                                    if connection.is_stream() {
+                                        return self.on_stream_send_failure();
+                                    }
                                 }
                             }
                         } else {

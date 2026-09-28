@@ -23,6 +23,17 @@ async fn uac(
     tokio::task::JoinHandle<crate::Result<Option<crate::sip::Response>>>,
     DialogStateReceiver,
 )> {
+    uac_with_t1(token, callee, Duration::from_millis(20)).await
+}
+
+async fn uac_with_t1(
+    token: &CancellationToken,
+    callee: &str,
+    t1: Duration,
+) -> crate::Result<(
+    tokio::task::JoinHandle<crate::Result<Option<crate::sip::Response>>>,
+    DialogStateReceiver,
+)> {
     let transport_layer = TransportLayer::new(token.child_token());
     let udp = UdpConnection::create_connection(
         "127.0.0.1:0".parse().unwrap(),
@@ -37,8 +48,8 @@ async fn uac(
         .with_transport_layer(transport_layer)
         .with_cancel_token(token.child_token())
         .with_option(EndpointOption {
-            t1: Duration::from_millis(20),
-            t1x64: Duration::from_millis(64 * 20),
+            t1,
+            t1x64: t1 * 64,
             ..Default::default()
         })
         .build();
@@ -111,6 +122,57 @@ async fn test_calling_is_not_notified_when_the_invite_cannot_be_sent() -> crate:
         !seen.iter().any(|s| s.ends_with("(Calling)")),
         "an INVITE that never reached the wire must not notify Calling, got {seen:?}"
     );
+    token.cancel();
+    Ok(())
+}
+
+/// The first send finds no connection (nothing listens yet); a Timer A
+/// retransmission connects and writes the INVITE. `Calling` is notified then,
+/// exactly once.
+#[tokio::test]
+async fn test_calling_is_notified_once_when_a_retransmission_first_writes_the_invite(
+) -> crate::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let token = CancellationToken::new();
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        probe.local_addr()?.port()
+    };
+    let callee = format!("sip:bob@127.0.0.1:{port};transport=tcp");
+    let (invite, mut states) = uac_with_t1(&token, &callee, Duration::from_millis(200)).await?;
+
+    // The initial connect is refused: nothing is on the wire yet.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        states.try_recv().is_err(),
+        "no state may be notified before the INVITE is written"
+    );
+
+    // The callee comes up; Timer A retries the lookup and writes the INVITE.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .expect("a Timer A retransmission must connect")?;
+    let mut buf = vec![0u8; 4096];
+    let len = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("the INVITE must be written")?;
+    assert!(std::str::from_utf8(&buf[..len])
+        .unwrap()
+        .starts_with("INVITE "));
+
+    // Let any further retransmission / notification happen.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut seen = Vec::new();
+    while let Ok(state) = states.try_recv() {
+        seen.push(state.to_string());
+    }
+    assert_eq!(
+        seen.iter().filter(|s| s.ends_with("(Calling)")).count(),
+        1,
+        "Calling must be notified exactly once, got {seen:?}"
+    );
+    invite.abort();
     token.cancel();
     Ok(())
 }

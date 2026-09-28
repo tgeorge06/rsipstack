@@ -38,25 +38,25 @@ too.
 - **rcx:** the same TCP/TLS trunk legs as patch 1.
 - **Test:** `dialog::tests::test_in_dialog_via`.
 
-## 3. `DialogState::Calling` notified after the transport write: carried, diverges
+## 3. `DialogState::Calling` notified after the transport write: carried
 
 - **Fork:** `InviteDialog::process_invite` and deprecated
-  `ClientInviteDialog::process_invite`, plus `Transaction::request_written()`
-  (`src/transaction/transaction.rs`).
-- **What:** `Calling` is notified after `tx.send()`, and only when the write
-  returned Ok.
-- **Diverges:** the fork's `Transaction::send` returns `Ok` even when no
-  connection could be found (Timer A retries the lookup) or a stream write
-  failed (a synthetic 503 follows). In the vendor both cases were `Err`. The
-  gate therefore uses `request_written()`. When the first send found no
-  connection and a Timer A retry delivers the INVITE later, no `Calling` is
-  notified at all. rcx then sees the first `Trying` / `Early`.
+  `ClientInviteDialog::process_invite` register `Transaction::on_first_write`
+  (`src/transaction/transaction.rs`) before the send.
+- **What:** `Calling` is notified exactly once, on the INVITE's first
+  successful transport write, whichever send makes it. The fork's
+  `Transaction::send` returns `Ok` even when no connection was found (Timer A
+  retries the lookup) or a stream write failed (a synthetic 503 follows),
+  where the vendor returned `Err`. So the signal comes from the transaction:
+  either the first `send()` or a Timer A retransmission. An INVITE that never
+  reaches the wire notifies nothing.
 - **rcx:** queue delivery `ringing` (`sip_session/queue/delivery.rs`
   `note_queue_invite_on_wire`, `reap_abandoned_offer_evidence`;
   `queue/dialing.rs`), `sip_session/dialing.rs`, RWI `CallRinging` and
   `park::dial_ring::note_invite_sent` (`rwi/processor/originate.rs`),
   `rwi/transfer.rs`.
-- **Test:** `dialog::tests::test_calling_after_send`.
+- **Test:** `dialog::tests::test_calling_after_send` (first send; first write
+  by a Timer A retransmission, notified once; never written).
 
 ## 4. Re-INVITE ACK correlation and answer surfacing (rcx PR #769): carried, diverges
 
@@ -95,10 +95,12 @@ too.
 - **What:** the armed body goes into the next in-dialog INVITE's 2xx ACK, with
   `Content-Type: application/sdp` and a matching `Content-Length`. It is
   consumed once.
-- **Diverges (small):** the armed body also survives a 401/407 retry.
+- **Diverges (small):** the armed body survives a 401/407 retry: only a 2xx
+  ACK consumes it, and the authenticated retry's 2xx ACK carries it. The
+  vendor lost it.
 - **rcx:** `tests/helpers/rtc_media_ua.rs` (offerless re-INVITE answered in the
   ACK; a stale ACK re-sent raw).
-- **Test:** `dialog::tests::test_uac_ack_body`.
+- **Test:** `dialog::tests::test_uac_ack_body` (including a 401 and a 407 retry).
 
 ## 6. A CSeq-mismatched ACK never touches a server INVITE transaction (rcx PR #769): in fork
 
@@ -138,8 +140,10 @@ too.
 
 ## 10. One notification per applied dialog transition (rcx PR #771): in fork, diverges
 
-- **Fork:** `DialogInner::transition` (fork PR #4). A transition after
-  `Terminated` is neither applied nor notified.
+- **Fork:** `DialogInner::transition` (fork PR #4). A lifecycle transition
+  after `Terminated` is neither applied nor notified. Event-only states
+  (`Updated`, `Notify`, `Info`, `Options`, `Refer`) are not gated: they are
+  notified whatever the lifecycle state, as in the vendor.
 - **Diverges:**
   - The ignored `WaitAck`-after-`Confirmed` transition is no longer notified
     (the vendor notified it). rcx does not depend on that. `WaitAck` only
