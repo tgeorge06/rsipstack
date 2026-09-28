@@ -35,6 +35,9 @@ async fn udp_exchange_logged_at(level: Level) -> crate::Result<String> {
         .with_writer(move || writer.clone())
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // Callsite interest is cached process-wide; recompute it for this
+    // subscriber.
+    tracing::callsite::rebuild_interest_cache();
 
     let bob = UdpConnection::create_connection("127.0.0.1:0".parse()?, None, None).await?;
     let alice = UdpConnection::create_connection("127.0.0.1:0".parse()?, None, None).await?;
@@ -60,28 +63,30 @@ async fn udp_exchange_logged_at(level: Level) -> crate::Result<String> {
         _ = bob.serve_loop(bob_tx) => panic!("serve_loop exited"),
         _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("no message received"),
     };
+    tracing::callsite::rebuild_interest_cache();
     bob.send(msg, Some(alice.get_addr())).await?;
 
     let out = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     Ok(out)
 }
 
+/// One test, both levels in turn: scoped subscribers in concurrent tests
+/// would race on the process-wide callsite interest cache.
 #[tokio::test]
-async fn test_udp_raw_messages_are_not_logged_at_info() -> crate::Result<()> {
+async fn test_udp_raw_messages_are_logged_at_debug_only() -> crate::Result<()> {
+    // The INFO check is only meaningful if the raw message is logged at all:
+    // at DEBUG both directions are.
+    let logged = udp_exchange_logged_at(Level::DEBUG).await?;
+    assert!(
+        logged.contains("udp received") && logged.contains("udp send"),
+        "got:\n{logged}"
+    );
+    assert!(logged.contains("secret-marker"));
+
     let logged = udp_exchange_logged_at(Level::INFO).await?;
     assert!(
         !logged.contains("secret-marker"),
         "raw SIP must not be logged at INFO, got:\n{logged}"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_udp_raw_messages_are_logged_at_debug() -> crate::Result<()> {
-    // The INFO test above is only meaningful if the raw message is logged
-    // at all: at DEBUG both directions are.
-    let logged = udp_exchange_logged_at(Level::DEBUG).await?;
-    assert!(logged.contains("udp received") && logged.contains("udp send"));
-    assert!(logged.contains("secret-marker"));
     Ok(())
 }
