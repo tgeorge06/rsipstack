@@ -48,6 +48,8 @@ fn create_request_with_branch(branch: &str) -> Request {
 
 fn create_401_response() -> Response {
     Response {
+        synthetic: false,
+        received_from: None,
         status_code: StatusCode::Unauthorized,
         version: crate::sip::Version::V2,
         headers: vec![

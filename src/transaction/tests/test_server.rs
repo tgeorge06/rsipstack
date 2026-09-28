@@ -80,6 +80,8 @@ async fn test_server_transaction() {
         assert_eq!(tx.original.method, crate::sip::method::Method::Register);
         let headers = tx.original.headers.clone();
         let done_response = crate::sip::Response {
+            synthetic: false,
+            received_from: None,
             status_code: crate::sip::StatusCode::OK,
             version: crate::sip::Version::V2,
             headers,

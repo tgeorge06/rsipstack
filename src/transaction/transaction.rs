@@ -349,9 +349,10 @@ impl Transaction {
                 .transport_layer
                 .retire_connection(connection);
         }
-        let response =
+        let mut response =
             self.endpoint_inner
                 .make_response(&self.original, StatusCode::ServiceUnavailable, None);
+        response.synthetic = true;
         self.inform_tu_response(response)
     }
 
@@ -769,9 +770,17 @@ impl Transaction {
 
     async fn on_received_response(
         &mut self,
-        resp: Response,
+        mut resp: Response,
         connection: Option<SipConnection>,
     ) -> Option<SipMessage> {
+        // Next to the packet source the endpoint stamped, record where this
+        // transaction actually sent its request (the resolved destination).
+        if let Some(provenance) = resp.received_from.as_mut() {
+            provenance.request_destination = self
+                .destination
+                .as_ref()
+                .and_then(|d| d.get_socketaddr().ok());
+        }
         match self.transaction_type {
             TransactionType::ServerInvite | TransactionType::ServerNonInvite => return None,
             _ => {}
@@ -875,11 +884,12 @@ impl Transaction {
                             .timeout(duration, TransactionTimer::TimerA(key, duration));
                         self.timer_a.replace(timer_a);
                     } else if let TransactionTimer::TimerB(_) = timer {
-                        let timeout_response = self.endpoint_inner.make_response(
+                        let mut timeout_response = self.endpoint_inner.make_response(
                             &self.original,
                             StatusCode::RequestTimeout,
                             None,
                         );
+                        timeout_response.synthetic = true;
                         self.inform_tu_response(timeout_response)?;
                     }
                 }
@@ -887,11 +897,12 @@ impl Transaction {
             TransactionState::Proceeding => {
                 if let TransactionTimer::TimerC(_) = timer {
                     // Inform TU about timeout
-                    let timeout_response = self.endpoint_inner.make_response(
+                    let mut timeout_response = self.endpoint_inner.make_response(
                         &self.original,
                         StatusCode::RequestTimeout,
                         None,
                     );
+                    timeout_response.synthetic = true;
                     self.inform_tu_response(timeout_response)?;
                 }
             }

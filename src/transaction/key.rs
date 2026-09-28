@@ -123,6 +123,8 @@ fn test_transaction_key() -> Result<()> {
         )
     );
     let register_resp = Response {
+        synthetic: false,
+        received_from: None,
         status_code: StatusCode::OK,
         version: Version::V2,
         headers: vec![

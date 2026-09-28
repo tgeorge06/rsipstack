@@ -1055,6 +1055,8 @@ impl DialogInner {
         ));
 
         Response {
+            synthetic: false,
+            received_from: None,
             status_code: status,
             headers: resp_headers,
             body: body.unwrap_or_default(),
