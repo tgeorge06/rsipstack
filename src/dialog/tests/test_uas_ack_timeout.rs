@@ -737,3 +737,149 @@ async fn test_unacked_reinvite_2xx_ends_the_session_on_a_uac_dialog() -> crate::
     token.cancel();
     Ok(())
 }
+
+/// Read SIP messages (no bodies) from `stream` until `deadline`.
+async fn read_tcp_messages(
+    stream: &mut tokio::net::TcpStream,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+) -> Vec<(Instant, SipMessage)> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let mut chunk = vec![0u8; 4096];
+    loop {
+        while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let text = String::from_utf8_lossy(&buf[..end + 4]).to_string();
+            buf.drain(..end + 4);
+            if let Ok(msg) = SipMessage::try_from(text.as_str()) {
+                out.push((Instant::now(), msg));
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return out;
+        }
+        match tokio::time::timeout(deadline - now, stream.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            _ => return out,
+        }
+    }
+}
+
+/// RFC 3261 §13.3.1.4: the UAS core retransmits a 2xx on every transport,
+/// reliable ones included (the 2xx can be lost at a later UDP hop), until
+/// the ACK arrives.
+#[tokio::test]
+async fn test_2xx_over_tcp_is_retransmitted_until_the_ack() -> crate::Result<()> {
+    use crate::transport::tcp_listener::TcpListenerConnection;
+    use tokio::io::AsyncWriteExt;
+    let token = CancellationToken::new();
+    let transport_layer = TransportLayer::new(token.child_token());
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let uas: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let tcp = TcpListenerConnection::new(uas.into(), None).await?;
+    transport_layer.add_transport(tcp.into());
+    let endpoint = EndpointBuilder::new()
+        .with_user_agent("rsipstack-test")
+        .with_transport_layer(transport_layer)
+        .with_cancel_token(token.child_token())
+        .with_option(short_timers())
+        .build();
+    endpoint.inner.transport_layer.serve_listens().await?;
+    let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
+    let mut incoming = endpoint.incoming_transactions()?;
+    let endpoint_inner = endpoint.inner.clone();
+    tokio::spawn(async move {
+        let _ = endpoint_inner.serve().await;
+    });
+    let (state_sender, mut states) = unbounded_channel();
+    let (dialog_sender, mut dialogs) = unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(mut tx) = incoming.recv().await {
+            let has_to_tag = tx.original.to_header().unwrap().tag().unwrap().is_some();
+            let dialog = if has_to_tag {
+                dialog_layer.match_dialog(&tx)
+            } else if tx.original.method == Method::Invite {
+                let dialog = dialog_layer
+                    .get_or_create_server_invite(&tx, state_sender.clone(), None, None)
+                    .expect("server dialog");
+                dialog_sender.send(dialog.clone()).unwrap();
+                Some(Dialog::Invite(dialog))
+            } else {
+                None
+            };
+            if let Some(mut dialog) = dialog {
+                tokio::spawn(async move {
+                    let _ = dialog.handle(&mut tx).await;
+                });
+            }
+        }
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(uas).await?;
+    let local = stream.local_addr()?;
+    let request = |method: Method, cseq: u32, to_tag: Option<&str>| {
+        let to = match to_tag {
+            Some(tag) => format!("<sip:bob@{uas}>;tag={tag}"),
+            None => format!("<sip:bob@{uas}>"),
+        };
+        format!(
+            "{method} sip:bob@{uas};transport=tcp SIP/2.0\r\n\
+             Via: SIP/2.0/TCP {local};branch=z9hG4bK-tcp-{method}-{cseq}\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sip:alice@{local}>;tag={FROM_TAG}\r\n\
+             To: {to}\r\n\
+             Call-ID: {CALL_ID}-tcp\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Contact: <sip:alice@{local};transport=tcp>\r\n\
+             Content-Length: 0\r\n\r\n"
+        )
+    };
+    stream
+        .write_all(request(Method::Invite, 1, None).as_bytes())
+        .await?;
+    let dialog = tokio::time::timeout(Duration::from_secs(2), dialogs.recv())
+        .await
+        .expect("timeout waiting for the server dialog")
+        .unwrap();
+    dialog.accept(None, None)?;
+
+    // No ACK yet: the 2xx is retransmitted (T1, 2*T1, 4*T1, ...).
+    let mut buf = Vec::new();
+    let before_ack = read_tcp_messages(&mut stream, &mut buf, Instant::now() + T1 * 12).await;
+    let oks: Vec<_> = before_ack.iter().filter(|(_, m)| is_2xx_to(m, 1)).collect();
+    assert!(
+        oks.len() >= 3,
+        "a 2xx over TCP must be retransmitted until the ACK, got {} transmissions",
+        oks.len()
+    );
+    let SipMessage::Response(ok) = &oks[0].1 else {
+        unreachable!()
+    };
+    let to_tag = ok.to_header()?.tag()?.unwrap().value().to_string();
+
+    stream
+        .write_all(request(Method::Ack, 1, Some(&to_tag)).as_bytes())
+        .await?;
+    let acked = Instant::now();
+    wait_confirmed(&mut states).await;
+    let after_ack = read_tcp_messages(&mut stream, &mut buf, acked + T1 * 30).await;
+    assert!(
+        !after_ack
+            .iter()
+            .any(|(at, m)| is_invite_2xx(m) && *at > acked + T1 * 2),
+        "the ACK must stop the 2xx retransmissions"
+    );
+    assert!(
+        !after_ack.iter().any(|(_, m)| matches!(
+            m,
+            SipMessage::Request(req) if req.method == Method::Bye
+        )),
+        "an ACKed call must not be ended"
+    );
+    assert!(dialog.state().is_confirmed());
+    token.cancel();
+    Ok(())
+}
