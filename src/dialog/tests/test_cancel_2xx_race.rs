@@ -549,13 +549,47 @@ async fn test_taken_dialog_2xx_crossing_the_owners_cancel_is_acked_and_byed() ->
     reply(&peer, uac, &cancel, 200, "OK").await;
     let _ = tokio::time::timeout(wait, hangup).await;
 
-    let (ack, _) = recv_request(&peer, Method::Ack, wait).await;
-    assert_in_dialog(&ack, &inv, "ACK");
-    let (bye, _) = recv_request(&peer, Method::Bye, wait).await;
-    assert_in_dialog(&bye, &inv, "BYE");
-    reply(&peer, uac, &bye, 200, "OK").await;
+    // Everything the UAC sends from here on, BYE answered, so a second
+    // CANCEL cannot hide behind a helper that skips other methods.
+    let requests = collect_requests(&peer, uac, Duration::from_millis(1500)).await;
+    let ack = requests
+        .iter()
+        .find(|r| r.method == Method::Ack)
+        .expect("the 2xx must be ACKed");
+    assert_in_dialog(ack, &inv, "ACK");
+    let bye = requests
+        .iter()
+        .find(|r| r.method == Method::Bye)
+        .expect("the 2xx must be BYE'd");
+    assert_in_dialog(bye, &inv, "BYE");
+    assert!(
+        !requests.iter().any(|r| r.method == Method::Cancel),
+        "the guard must not send a second CANCEL, got {:?}",
+        requests
+            .iter()
+            .map(|r| r.method.to_string())
+            .collect::<Vec<_>>()
+    );
     token.cancel();
     Ok(())
+}
+
+/// Every request the peer receives within `window`, answering each BYE 200.
+async fn collect_requests(socket: &UdpSocket, uac: SocketAddr, window: Duration) -> Vec<Request> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let deadline = tokio::time::Instant::now() + window;
+    while let Ok(Ok((len, _))) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await
+    {
+        let text = std::str::from_utf8(&buf[..len]).expect("non utf-8 SIP message");
+        if let Ok(SipMessage::Request(req)) = SipMessage::try_from(text) {
+            if req.method == Method::Bye {
+                reply(socket, uac, &req, 200, "OK").await;
+            }
+            out.push(req);
+        }
+    }
+    out
 }
 
 /// Taken while still `Calling`: the owner's hangup cannot CANCEL before a
