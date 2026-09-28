@@ -505,3 +505,97 @@ async fn test_abandoned_before_provisional_2xx_crossing_deferred_cancel_is_byed(
     token.cancel();
     Ok(())
 }
+
+/// Another owner takes the dialog out of the layer (`take_dialog`) and
+/// CANCELs it, then the `do_invite` future is dropped. The guard no longer
+/// holds a layer entry, but still holds the INVITE transaction: a 2xx
+/// crossing that CANCEL is ACKed and BYE'd, and no second CANCEL is sent.
+#[tokio::test]
+async fn test_taken_dialog_2xx_crossing_the_owners_cancel_is_acked_and_byed() -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let Uac {
+        dialog_layer,
+        option,
+        peer,
+    } = setup(&token).await?;
+    let wait = Duration::from_secs(2);
+
+    let (state_sender, mut states) = unbounded_channel();
+    let layer = dialog_layer.clone();
+    let invite = tokio::spawn(async move { layer.do_invite(option, state_sender).await });
+    let (inv, uac) = recv_request(&peer, Method::Invite, wait).await;
+    // The layer keys the dialog by its id before any To tag.
+    let calling = wait_for_state(&mut states, "Calling", wait, |s| {
+        matches!(s, DialogState::Calling(_))
+    })
+    .await;
+    reply(&peer, uac, &inv, 180, "Ringing").await;
+    wait_for_state(&mut states, "Early", wait, |s| {
+        matches!(s, DialogState::Early(_, _))
+    })
+    .await;
+
+    // The owner takes the dialog and hangs it up (a CANCEL while early).
+    let taken = dialog_layer
+        .take_dialog(calling.id())
+        .expect("the early dialog is in the layer");
+    let hangup = tokio::spawn(async move { taken.hangup().await });
+    let (cancel, _) = recv_request(&peer, Method::Cancel, wait).await;
+    invite.abort();
+    let _ = invite.await;
+
+    // The callee answered before the CANCEL reached it.
+    reply(&peer, uac, &inv, 200, "OK").await;
+    reply(&peer, uac, &cancel, 200, "OK").await;
+    let _ = tokio::time::timeout(wait, hangup).await;
+
+    let (ack, _) = recv_request(&peer, Method::Ack, wait).await;
+    assert_in_dialog(&ack, &inv, "ACK");
+    let (bye, _) = recv_request(&peer, Method::Bye, wait).await;
+    assert_in_dialog(&bye, &inv, "BYE");
+    reply(&peer, uac, &bye, 200, "OK").await;
+    token.cancel();
+    Ok(())
+}
+
+/// Taken while still `Calling`: the owner's hangup cannot CANCEL before a
+/// provisional response, so the dropped guard abandons the INVITE itself:
+/// it CANCELs on the first provisional.
+#[tokio::test]
+async fn test_taken_dialog_before_provisional_is_cancelled_after_first_provisional(
+) -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let Uac {
+        dialog_layer,
+        option,
+        peer,
+    } = setup(&token).await?;
+    let wait = Duration::from_secs(2);
+
+    let (state_sender, mut states) = unbounded_channel();
+    let layer = dialog_layer.clone();
+    let invite = tokio::spawn(async move { layer.do_invite(option, state_sender).await });
+    let (inv, uac) = recv_request(&peer, Method::Invite, wait).await;
+    let calling = wait_for_state(&mut states, "Calling", wait, |s| {
+        matches!(s, DialogState::Calling(_))
+    })
+    .await;
+    let taken = dialog_layer
+        .take_dialog(calling.id())
+        .expect("the dialog is in the layer");
+    taken.hangup().await?;
+    invite.abort();
+    let _ = invite.await;
+
+    reply(&peer, uac, &inv, 180, "Ringing").await;
+    let (cancel, _) = recv_request(&peer, Method::Cancel, wait).await;
+    assert_eq!(
+        cancel.call_id_header().unwrap().value(),
+        inv.call_id_header().unwrap().value()
+    );
+    reply(&peer, uac, &cancel, 200, "OK").await;
+    reply(&peer, uac, &inv, 487, "Request Terminated").await;
+    recv_request(&peer, Method::Ack, wait).await;
+    token.cancel();
+    Ok(())
+}
