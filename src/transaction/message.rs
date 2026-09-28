@@ -244,6 +244,8 @@ impl EndpointInner {
         ));
         headers.unique_push(Header::UserAgent(self.user_agent.clone().into()));
         Response {
+            synthetic: false,
+            received_from: None,
             status_code,
             version: *req.version(),
             headers,

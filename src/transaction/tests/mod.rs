@@ -9,6 +9,7 @@ mod test_before_send;
 mod test_client;
 mod test_endpoint;
 mod test_provisional_responses;
+mod test_response_provenance;
 mod test_server;
 mod test_server_invite_ack;
 mod test_server_invite_drop;
@@ -93,6 +94,26 @@ mod tests {
 
         let call_id = make_call_id(None, CallIdFormat::Uuid).0;
         assert_uuid_v4(&call_id);
+    }
+
+    /// `Random22` reproduces the rsipstack 0.5.x Call-ID: 22 random ASCII
+    /// alphanumerics, `@`, then the suffix (default `restsend.com`).
+    #[test]
+    fn test_make_call_id_random22() {
+        for (suffix, expected) in [(None, "restsend.com"), (Some("example.com"), "example.com")] {
+            let call_id = make_call_id(suffix, CallIdFormat::Random22).0;
+            let (random, got) = call_id.split_once('@').unwrap();
+            assert_eq!(random.len(), 22, "{call_id}");
+            assert!(
+                random.chars().all(|c| c.is_ascii_alphanumeric()),
+                "{call_id}"
+            );
+            assert_eq!(got, expected);
+        }
+        assert_ne!(
+            make_call_id(None, CallIdFormat::Random22).0,
+            make_call_id(None, CallIdFormat::Random22).0
+        );
     }
 
     #[test]

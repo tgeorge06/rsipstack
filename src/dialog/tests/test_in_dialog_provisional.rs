@@ -22,7 +22,7 @@ const PEER_TAG: &str = "peer-tag";
 
 /// Receive the next request with `method` on the raw peer socket, skipping
 /// anything else (retransmissions, ACKs we are not waiting for).
-async fn recv_request(socket: &UdpSocket, method: Method) -> (Request, SocketAddr) {
+pub(super) async fn recv_request(socket: &UdpSocket, method: Method) -> (Request, SocketAddr) {
     let mut buf = vec![0u8; 4096];
     loop {
         let (len, from) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
@@ -81,8 +81,16 @@ fn drain_states(rx: &mut DialogStateReceiver) -> Vec<DialogState> {
 
 /// Set up a UAC endpoint and a raw UDP peer, and establish a dialog whose
 /// initial INVITE is answered 100 → 183 → 200. Returns the confirmed dialog.
-async fn establish(
+pub(super) async fn establish(
     token: &CancellationToken,
+) -> crate::Result<(InviteDialog, DialogStateReceiver, UdpSocket)> {
+    establish_with_credential(token, None).await
+}
+
+/// [`establish`], with `credential` set on the dialog for later challenges.
+pub(super) async fn establish_with_credential(
+    token: &CancellationToken,
+    credential: Option<crate::dialog::authenticate::Credential>,
 ) -> crate::Result<(InviteDialog, DialogStateReceiver, UdpSocket)> {
     let peer = UdpSocket::bind("127.0.0.1:0").await?;
     let peer_port = peer.local_addr()?.port();
@@ -112,6 +120,7 @@ async fn establish(
         caller: Uri::try_from("sip:alice@example.com")?,
         callee: Uri::try_from(format!("sip:bob@127.0.0.1:{peer_port};transport=udp").as_str())?,
         contact: Uri::try_from(format!("sip:alice@{uac_addr}").as_str())?,
+        credential,
         ..Default::default()
     };
     let invite = tokio::spawn(async move {
@@ -181,15 +190,12 @@ async fn assert_provisional_keeps_confirmed(method: Method) -> crate::Result<()>
         "dialog must be Confirmed after the in-dialog {method} completes, state: {}",
         dialog.state()
     );
-    // The 183 is still delivered to the caller, it just does not change the
-    // dialog's state.
+    // The 183 neither changes the dialog's state nor is notified as `Early`:
+    // subscribers read `Early` as the dialog's own early state.
     let states = drain_states(&mut states);
     assert!(
-        states.iter().any(|s| matches!(
-            s,
-            DialogState::Early(_, r) if r.status_code == crate::sip::StatusCode::SessionProgress
-        )),
-        "the 183 to an in-dialog {method} must still be notified, got {states:?}"
+        !states.iter().any(|s| matches!(s, DialogState::Early(_, _))),
+        "a 183 to an in-dialog {method} must not be notified as Early, got {states:?}"
     );
 
     // The call can still be hung up with a BYE.

@@ -43,6 +43,8 @@ fn create_response(status: StatusCode, from_tag: &str, to_tag: &str, call_id: &s
     };
 
     Response {
+        synthetic: false,
+        received_from: None,
         status_code: status,
         version: crate::sip::Version::V2,
         headers: vec![

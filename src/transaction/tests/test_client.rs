@@ -50,6 +50,8 @@ async fn test_client_transaction() -> Result<()> {
                                 SipMessage::Request(req) => {
                                     let headers = req.headers.clone();
                                     let response = SipMessage::Response(crate::sip::message::Response {
+                                        synthetic: false,
+                                        received_from: None,
                                         version: crate::sip::Version::V2,
                                         status_code:crate::sip::StatusCode::Trying,
                                         headers: headers.clone(),
@@ -59,6 +61,8 @@ async fn test_client_transaction() -> Result<()> {
                                     sleep(Duration::from_millis(100)).await;
 
                                     let response = SipMessage::Response(crate::sip::message::Response {
+                                        synthetic: false,
+                                        received_from: None,
                                         version: crate::sip::Version::V2,
                                         status_code:crate::sip::StatusCode::OK,
                                         headers,

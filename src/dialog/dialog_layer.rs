@@ -157,7 +157,12 @@ impl DialogLayer {
         if !id.local_tag.is_empty() {
             let dlg = self.inner.dialogs.get(&id.to_string()).map(|d| d.clone());
             match dlg {
-                Some(Dialog::Invite(dlg)) => return Ok(dlg),
+                // Only a UAS dialog answers an in-dialog request here, as the
+                // role-typed `Dialog::ServerInvite` did before the unified
+                // `InviteDialog`.
+                Some(Dialog::Invite(dlg)) if dlg.role() == TransactionRole::Server => {
+                    return Ok(dlg)
+                }
                 _ => {
                     return Err(crate::Error::DialogError(
                         "the dialog not found".to_string(),
@@ -459,7 +464,12 @@ impl DialogLayer {
             .dialogs
             .iter()
             .filter_map(|e| match e.value() {
-                Dialog::Invite(client_dlg) if client_dlg.id().call_id == call_id => {
+                // UAC dialogs only: with a transparent Call-ID, the inbound
+                // (UAS) leg of a proxied call shares it.
+                Dialog::Invite(client_dlg)
+                    if client_dlg.role() == TransactionRole::Client
+                        && client_dlg.id().call_id == call_id =>
+                {
                     Some(client_dlg.clone())
                 }
                 _ => None,
@@ -512,6 +522,20 @@ impl DialogLayer {
         if let Some((_, d)) = self.inner.dialogs.remove(&id.to_string()) {
             d.on_remove()
         }
+    }
+
+    /// Remove the dialog and return it, in one map operation.
+    ///
+    /// When several tasks may end the same dialog, each doing `get_dialog`
+    /// then `remove_dialog` lets two of them hold it and both send a BYE.
+    /// `take_dialog` gives the dialog to exactly one caller, which then owns
+    /// its teardown. Like `remove_dialog`, the dialog's cancel token is
+    /// cancelled.
+    pub fn take_dialog(&self, id: &DialogId) -> Option<Dialog> {
+        self.inner.dialogs.remove(&id.to_string()).map(|(_, d)| {
+            d.on_remove();
+            d
+        })
     }
 
     pub fn match_dialog(&self, tx: &Transaction) -> Option<Dialog> {

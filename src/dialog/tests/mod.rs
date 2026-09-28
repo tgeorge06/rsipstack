@@ -1,6 +1,8 @@
 mod test_ack_answer;
 mod test_authenticate;
+mod test_calling_after_send;
 mod test_bye_after_peer_closed;
+mod test_bye_lifecycle;
 mod test_cancel_2xx_race;
 mod test_client_dialog;
 mod test_connection_affinity;
@@ -16,5 +18,7 @@ mod test_refer;
 mod test_server_dialog;
 mod test_session_id;
 mod test_state_after_terminated;
+mod test_sticky_transport;
 mod test_sub_pub;
+mod test_uac_ack_body;
 mod test_uas_ack_timeout;

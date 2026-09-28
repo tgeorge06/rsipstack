@@ -3,7 +3,7 @@
 //! RFC 3264 §4). The server dialog must make that ACK available to the
 //! application, otherwise the offer/answer exchange can never complete.
 use crate::dialog::{
-    dialog::{DialogState, DialogStateReceiver},
+    dialog::{DialogState, DialogStateReceiver, ReinviteAck},
     dialog_layer::DialogLayer,
     invite_dialog::InviteDialog,
 };
@@ -208,6 +208,11 @@ async fn test_answer_in_ack_to_initial_invite_is_available() -> crate::Result<()
     assert_eq!(ack.method, Method::Ack);
     assert_eq!(ack.cseq_header()?.seq()?, 1);
     assert_eq!(ack.body, answer(1).as_bytes(), "the ACK carries the answer");
+    assert_eq!(
+        dialog.take_reinvite_ack(),
+        None,
+        "the initial INVITE's ACK is not a re-INVITE outcome"
+    );
     token.cancel();
     Ok(())
 }
@@ -261,6 +266,53 @@ async fn test_answer_in_ack_to_reinvite_is_available() -> crate::Result<()> {
         "the ACK of the re-INVITE, not the initial one"
     );
     assert_eq!(ack.body, answer(2).as_bytes(), "the ACK carries the answer");
+    assert_eq!(
+        dialog.take_reinvite_ack(),
+        Some(ReinviteAck::Received {
+            cseq: 2,
+            body: Some(answer(2).into_bytes()),
+        }),
+        "the re-INVITE's outcome carries the ACK's CSeq and answer"
+    );
+    assert_eq!(
+        dialog.take_reinvite_ack(),
+        None,
+        "the outcome is taken once"
+    );
+
+    // A bodiless ACK to the next re-INVITE is surfaced as such.
+    peer.send_request(Method::Invite, 3, "z9hG4bK-invite-3", Some(&to_tag), None)
+        .await;
+    loop {
+        if let DialogState::Updated(_, _, handle) = next_state(&mut uas.states).await {
+            handle
+                .respond(
+                    crate::sip::StatusCode::OK,
+                    None,
+                    Some(OFFER.as_bytes().to_vec()),
+                )
+                .await
+                .unwrap();
+            break;
+        }
+    }
+    peer.recv_2xx(3).await;
+    peer.send_request(Method::Ack, 3, "z9hG4bK-ack-3", Some(&to_tag), None)
+        .await;
+    let confirmed = loop {
+        if let DialogState::Confirmed(_, resp) = next_state(&mut uas.states).await {
+            break resp;
+        }
+    };
+    assert_eq!(confirmed.cseq_header()?.seq()?, 3);
+    assert_eq!(
+        dialog.take_reinvite_ack(),
+        Some(ReinviteAck::Received {
+            cseq: 3,
+            body: None
+        }),
+        "the outcome is stored before Confirmed is notified"
+    );
     token.cancel();
     Ok(())
 }

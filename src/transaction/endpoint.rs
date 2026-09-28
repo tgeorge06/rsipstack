@@ -472,11 +472,22 @@ impl EndpointInner {
             }
         };
 
-        let msg = if let Some(inspector) = &self.message_inspector {
+        let mut msg = if let Some(inspector) = &self.message_inspector {
             inspector.after_received(msg, Some(from))
         } else {
             msg
         };
+        // Stamp the packet's source on a received response, after the
+        // inspectors (which may rebuild the message).
+        if let SipMessage::Response(ref mut resp) = msg {
+            resp.received_from =
+                from.get_socketaddr()
+                    .ok()
+                    .map(|source| crate::sip::message::ReceivedFrom {
+                        source,
+                        request_destination: None,
+                    });
+        }
 
         if let Some(tu) = self.transactions.get(&key) {
             tu.send(TransactionEvent::Received(msg, Some(connection)))

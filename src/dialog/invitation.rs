@@ -186,11 +186,59 @@ pub(super) struct DialogGuardForUnconfirmed<'a> {
     pub dialog_layer_inner: &'a DialogLayerInnerRef,
     pub id: &'a DialogId,
     invite_tx: Option<Transaction>,
+    /// The dialog itself, so a 2xx crossing a CANCEL sent by another owner
+    /// (one that took the dialog out of the layer) can still be BYE'd.
+    dialog: InviteDialog,
+    /// `process_invite` ran to completion: nothing left to watch.
+    finished: bool,
+}
+
+impl DialogGuardForUnconfirmed<'_> {
+    /// Dropped mid-INVITE after another owner took the dialog out of the
+    /// layer (`DialogLayer::take_dialog`) to end it. That owner does not hold
+    /// the INVITE transaction, so a 2xx crossing its CANCEL would be ACKed
+    /// by the transaction and never BYE'd. Keep the transaction and watch it
+    /// (up to 64*T1) for a 2xx to BYE. No second CANCEL is sent: the owner
+    /// sends it. A CANCEL cannot be sent before a provisional response, so
+    /// while the dialog is still `Calling` the owner's hangup sent nothing:
+    /// the dialog is then abandoned as if it were still in the layer.
+    fn watch_taken_dialog(&mut self) {
+        if self.finished {
+            return;
+        }
+        let client_dialog = self.dialog.clone();
+        let Some(mut invite_tx) = self.invite_tx.take() else {
+            return;
+        };
+        match client_dialog.state() {
+            DialogState::Calling(_) => {
+                debug!(id = %client_dialog.id(), "taken dialog dropped before provisional response");
+                let _ = client_dialog.inner.transition(DialogState::Terminated(
+                    client_dialog.id(),
+                    TerminatedReason::UacCancel,
+                ));
+                tokio::spawn(abandon_before_provisional(client_dialog, invite_tx));
+            }
+            DialogState::Trying(_) | DialogState::Early(_, _) => {
+                debug!(id = %client_dialog.id(), "taken dialog dropped mid-INVITE, watching for a 2xx");
+                tokio::spawn(async move {
+                    invite_tx.stop_retransmissions();
+                    let deadline =
+                        tokio::time::Instant::now() + invite_tx.endpoint_inner.option.t1x64;
+                    let final_response = wait_final_response(&mut invite_tx, deadline).await;
+                    drop(invite_tx);
+                    bye_if_2xx_after_cancel(&client_dialog, final_response).await;
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
     fn drop(&mut self) {
         let Some((_, dlg)) = self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) else {
+            self.watch_taken_dialog();
             return;
         };
 
@@ -210,39 +258,10 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
                     TerminatedReason::UacCancel,
                 ));
                 debug!(id = %client_dialog.id(), "dialog terminated before provisional response");
-                let Some(mut invite_tx) = invite_tx else {
+                let Some(invite_tx) = invite_tx else {
                     return;
                 };
-                let _handle = tokio::spawn(async move {
-                    invite_tx.stop_retransmissions();
-                    let t1x64 = invite_tx.endpoint_inner.option.t1x64;
-                    let deadline = tokio::time::Instant::now() + t1x64;
-                    let final_response = match wait_response(&mut invite_tx, deadline).await {
-                        Some(resp) if resp.status_code.kind() == StatusCodeKind::Provisional => {
-                            // A fresh window for the CANCEL and the final response.
-                            let deadline = tokio::time::Instant::now() + t1x64;
-                            let cancel = client_dialog.send_cancel();
-                            tokio::pin!(cancel);
-                            let mut cancel_done = false;
-                            let final_wait = wait_final_response(&mut invite_tx, deadline);
-                            tokio::pin!(final_wait);
-                            loop {
-                                tokio::select! {
-                                    result = &mut cancel, if !cancel_done => {
-                                        cancel_done = true;
-                                        if let Err(e) = result {
-                                            warn!(id = %client_dialog.id(), error = %e, "dialog cancel failed");
-                                        }
-                                    }
-                                    resp = &mut final_wait => break resp,
-                                }
-                            }
-                        }
-                        other => other,
-                    };
-                    drop(invite_tx);
-                    bye_if_2xx_after_cancel(&client_dialog, final_response).await;
-                });
+                let _handle = tokio::spawn(abandon_before_provisional(client_dialog, invite_tx));
             }
             DialogState::Terminated(_, _) => {}
             DialogState::Trying(_) | DialogState::Early(_, _) => {
@@ -327,6 +346,41 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
             _ => {}
         }
     }
+}
+
+/// Abandon an INVITE that has had no response yet. CANCEL cannot be sent
+/// before a provisional response (RFC 3261 §9.1): the INVITE stops
+/// retransmitting; if the callee got it, wait for its first response and
+/// CANCEL on a provisional, or ACK and BYE a 2xx.
+async fn abandon_before_provisional(client_dialog: InviteDialog, mut invite_tx: Transaction) {
+    invite_tx.stop_retransmissions();
+    let t1x64 = invite_tx.endpoint_inner.option.t1x64;
+    let deadline = tokio::time::Instant::now() + t1x64;
+    let final_response = match wait_response(&mut invite_tx, deadline).await {
+        Some(resp) if resp.status_code.kind() == StatusCodeKind::Provisional => {
+            // A fresh window for the CANCEL and the final response.
+            let deadline = tokio::time::Instant::now() + t1x64;
+            let cancel = client_dialog.send_cancel();
+            tokio::pin!(cancel);
+            let mut cancel_done = false;
+            let final_wait = wait_final_response(&mut invite_tx, deadline);
+            tokio::pin!(final_wait);
+            loop {
+                tokio::select! {
+                    result = &mut cancel, if !cancel_done => {
+                        cancel_done = true;
+                        if let Err(e) = result {
+                            warn!(id = %client_dialog.id(), error = %e, "dialog cancel failed");
+                        }
+                    }
+                    resp = &mut final_wait => break resp,
+                }
+            }
+        }
+        other => other,
+    };
+    drop(invite_tx);
+    bye_if_2xx_after_cancel(&client_dialog, final_response).await;
 }
 
 /// End the session a 2xx to an abandoned INVITE established.
@@ -703,6 +757,8 @@ impl DialogLayer {
             dialog_layer_inner: &self.inner,
             id: &id,
             invite_tx: Some(tx),
+            dialog: dialog.clone(),
+            finished: false,
         };
 
         let tx = guard
@@ -711,6 +767,7 @@ impl DialogLayer {
             .expect("transcation should be avaible");
 
         let r = dialog.process_invite(tx).boxed().await;
+        guard.finished = true;
         self.inner.dialogs.remove(&id.to_string());
 
         match r {

@@ -116,6 +116,8 @@ fn parse_response_line(line: &str, headers: Headers, body: Vec<u8>) -> Result<Si
     let status_code = StatusCode::try_from((code, reason))?;
 
     Ok(SipMessage::Response(Response {
+        synthetic: false,
+        received_from: None,
         status_code,
         version,
         headers,

@@ -129,6 +129,18 @@ pub enum DialogState {
     Terminated(DialogId, TerminatedReason),
 }
 
+/// How the re-INVITE transaction on an established dialog ended: the ACK
+/// correlated to the re-INVITE by CSeq, with the body a UAC puts there when
+/// the 2xx carried the offer (RFC 3261 §14.2), or no ACK before the
+/// transaction ended after a 2xx. Read with
+/// [`InviteDialog::take_reinvite_ack`](crate::dialog::invite_dialog::InviteDialog::take_reinvite_ack)
+/// after the `Confirmed` state the dialog notifies for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReinviteAck {
+    Received { cseq: u32, body: Option<Vec<u8>> },
+    TimedOut { cseq: u32 },
+}
+
 #[derive(Debug, Clone)]
 pub enum TerminatedReason {
     Timeout,
@@ -335,6 +347,15 @@ pub struct DialogInner {
     /// The last ACK received for an INVITE or re-INVITE this dialog answered
     /// (UAS role). Carries the answer when the 2xx carried the offer.
     pub(super) remote_ack: Mutex<Option<Request>>,
+    /// The outcome of the last re-INVITE transaction this dialog answered,
+    /// see [`ReinviteAck`]. Taken by `InviteDialog::take_reinvite_ack`.
+    pub(super) reinvite_ack: Mutex<Option<ReinviteAck>>,
+    /// UAC side: the body the NEXT in-dialog INVITE's 2xx ACK carries (the
+    /// answer to an offer in that 2xx, RFC 3261 §14.2), consumed by that one
+    /// request. Armed with `InviteDialog::set_next_ack_body`.
+    pub(super) next_ack_body: Mutex<Option<Vec<u8>>>,
+    /// UAC side: the last 2xx ACK this dialog sent for an in-dialog INVITE.
+    pub(super) last_sent_ack: Mutex<Option<Request>>,
     pub(super) server_connection: Mutex<Option<SipConnection>>,
     /// Structural source address of the flow that created this server dialog,
     /// captured at creation time from the connection itself (not parsed from
@@ -501,6 +522,9 @@ impl DialogInner {
             supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
+            reinvite_ack: Mutex::new(None),
+            next_ack_body: Mutex::new(None),
+            last_sent_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
         })
@@ -709,10 +733,11 @@ impl DialogInner {
                 warn!(
                     id = self.id.lock().to_string(),
                     destination = tx.destination.as_ref().map(|d| d.to_string()).as_deref(),
-                    "failed to send request error: {}\n{}",
-                    e,
-                    tx.original
+                    method = %tx.original.method,
+                    "failed to send request error: {}",
+                    e
                 );
+                debug!(id = self.id.lock().to_string(), req = %tx.original, "request that failed to send");
                 return Err(e);
             }
         }
@@ -782,6 +807,43 @@ impl DialogInner {
     /// the dialog (RFC 3261 §12.1.2). Persisting it here ensures all subsequent
     /// in-dialog requests reuse the same proxy chain instead of targeting the
     /// remote contact directly.
+    /// Take the route set, Contact and remote target from a 2xx to the
+    /// INVITE (RFC 3261 §12.1.2).
+    ///
+    /// Sticky transport: when the established remote target carries a
+    /// non-UDP `;transport=` parameter and the 2xx Contact names none, the
+    /// parameter is carried over onto the adopted target (a `sips` Contact keeps TLS
+    /// through its scheme). In-dialog requests (BYE, re-INVITE, UPDATE)
+    /// resolve their connection from the remote target, so adopting a bare
+    /// Contact would silently move a TCP call's mid-dialog requests to UDP.
+    pub(super) fn adopt_2xx_remote_target(&self, resp: &Response) -> Result<()> {
+        self.update_route_set_from_response(resp);
+        let contact = resp.contact_header()?;
+        self.remote_contact.lock().replace(contact.clone());
+
+        let mut contact_uri = resp
+            .typed_contact_headers()?
+            .first()
+            .map(|c| c.uri.clone())
+            .ok_or_else(|| crate::Error::Error("missing Contact header".to_string()))?;
+        let mut remote_uri = self.remote_uri.lock();
+        let established_transport = remote_uri.params.iter().find_map(|p| match p {
+            Param::Transport(t) if *t != crate::sip::Transport::Udp => Some(*t),
+            _ => None,
+        });
+        if let Some(transport) = established_transport {
+            let has_transport = contact_uri
+                .params
+                .iter()
+                .any(|p| matches!(p, Param::Transport(_)));
+            if !has_transport && contact_uri.scheme != Some(crate::sip::Scheme::Sips) {
+                contact_uri.params.push(Param::Transport(transport));
+            }
+        }
+        *remote_uri = contact_uri;
+        Ok(())
+    }
+
     pub(crate) fn update_route_set_from_response(&self, resp: &Response) {
         if !matches!(self.role, TransactionRole::Client) {
             return;
@@ -1055,6 +1117,8 @@ impl DialogInner {
         ));
 
         Response {
+            synthetic: false,
+            received_from: None,
             status_code: status,
             headers: resp_headers,
             body: body.unwrap_or_default(),
@@ -1128,6 +1192,11 @@ impl DialogInner {
             self.endpoint_inner.clone(),
             affinity_connection,
         );
+        // The transaction builds the 2xx ACK, so it gets the body armed on
+        // the dialog for this one INVITE (see `next_ack_body`).
+        if method == Method::Invite {
+            tx.ack_body = self.next_ack_body.lock().take();
+        }
 
         if let Some(route) = tx.original.route_header() {
             if let Ok(first_route) = route.typed() {
@@ -1155,10 +1224,11 @@ impl DialogInner {
                     warn!(
                         id = self.id.lock().to_string(),
                         destination = tx.destination.as_ref().map(|d| d.to_string()).as_deref(),
-                        req = %tx.original,
+                        method = %method,
                         "failed to send request error: {}",
                         e
                     );
+                    debug!(id = self.id.lock().to_string(), req = %tx.original, "request that failed to send");
                     return Err(e);
                 }
             }
@@ -1256,12 +1326,11 @@ impl DialogInner {
                         // and never back. A 1xx to a mid-dialog request (re-INVITE,
                         // UPDATE, ...) must not regress an established dialog to
                         // Early, or BYE is refused and hangup() tries to CANCEL.
-                        // The provisional is still notified so the caller sees it.
-                        let state = DialogState::Early(self.id.lock().clone(), resp);
+                        // Nor is it notified: subscribers treat `Early` as the
+                        // dialog's early state (ringing), not as a provisional
+                        // to a later transaction.
                         if self.can_cancel() {
-                            self.transition(state)?;
-                        } else {
-                            self.state_sender.send(state).ok();
+                            self.transition(DialogState::Early(self.id.lock().clone(), resp))?;
                         }
                         continue;
                     }
@@ -1288,7 +1357,9 @@ impl DialogInner {
                                 crate::sip::Method::Cancel => self.get_local_seq(),
                                 _ => self.increment_local_seq(),
                             };
+                            let ack_body = tx.ack_body.take();
                             tx = handle_client_authenticate(new_seq, &tx, resp, cred).await?;
+                            tx.ack_body = ack_body;
                             tx.send().await?;
                             continue;
                         } else {
@@ -1312,6 +1383,10 @@ impl DialogInner {
                     if !matches!(method, Method::PRack) {
                         self.clear_remote_reliable();
                     }
+                    // Keep the 2xx ACK this INVITE sent (see `last_sent_ack`).
+                    if method == Method::Invite && tx.sent_ack.is_some() {
+                        *self.last_sent_ack.lock() = tx.sent_ack.clone();
+                    }
                     return Ok(Some(resp));
                 }
                 _ => break,
@@ -1324,10 +1399,97 @@ impl DialogInner {
         self.send_dialog_request(request).boxed().await
     }
 
-    /// RFC 3261 §13.3.1.4: the server transaction of an INVITE or re-INVITE
+    /// Send the BYE that ends this dialog and notify `Terminated`, with the
+    /// lifecycle subscribers rely on to finish their teardown:
+    ///
+    /// * UAS: `Terminated(UasBye)` is notified before the BYE is sent, so it
+    ///   never waits for the BYE's response; the send result is returned.
+    /// * UAC: the BYE transaction runs, then `Terminated(UacBye)` is notified
+    ///   whatever its outcome. A failed send is logged and the dialog still
+    ///   ends locally; `Ok` is returned.
+    pub(super) async fn send_bye(&self, request: Request) -> Result<()> {
+        let id = self.id.lock().clone();
+        match self.role {
+            TransactionRole::Server => {
+                self.transition(DialogState::Terminated(id, TerminatedReason::UasBye))?;
+                self.do_request(request).await.map(|_| ())
+            }
+            TransactionRole::Client => {
+                if let Err(e) = self.do_request(request).await {
+                    info!(%id, error = %e, "bye error, ending the dialog locally");
+                }
+                self.transition(DialogState::Terminated(id, TerminatedReason::UacBye))
+            }
+        }
+    }
+
+    /// Wait for the ACK of a re-INVITE this dialog answered, until the
+    /// server transaction ends.
+    ///
+    /// The ACK is accepted only when its CSeq equals the re-INVITE's (an ACK
+    /// of another transaction is ignored and the wait continues). It is
+    /// stored as [`ReinviteAck::Received`] (and as the last remote ACK)
+    /// before the `Confirmed` state is notified. When the transaction ends
+    /// without an ACK after a 2xx, [`ReinviteAck::TimedOut`] is stored and
+    /// `Confirmed` is notified for it: a re-INVITE's missing ACK does not end
+    /// the session, the application decides (e.g. restores the previous
+    /// offer/answer).
+    pub(super) async fn await_reinvite_ack(&self, tx: &mut Transaction) -> Result<()> {
+        let reinvite_cseq = tx
+            .original
+            .cseq_header()
+            .and_then(|c| c.seq())
+            .unwrap_or_default();
+        // The final response, read before the wait: a server INVITE
+        // transaction gives up `last_response` when it terminates.
+        let final_response = tx.last_response.clone();
+        while let Some(msg) = tx.receive().await {
+            let SipMessage::Request(req) = msg else {
+                continue;
+            };
+            if req.method != Method::Ack {
+                continue;
+            }
+            let ack_cseq = req.cseq_header().and_then(|c| c.seq()).unwrap_or_default();
+            if ack_cseq != reinvite_cseq {
+                debug!(
+                    id = %self.id.lock(),
+                    ack_cseq,
+                    reinvite_cseq,
+                    "ignoring ACK that does not belong to this re-invite"
+                );
+                continue;
+            }
+            debug!(id = %self.id.lock(), "received ack for re-invite {}", req.uri);
+            *self.reinvite_ack.lock() = Some(ReinviteAck::Received {
+                cseq: ack_cseq,
+                body: (!req.body.is_empty()).then(|| req.body.clone()),
+            });
+            self.remote_ack.lock().replace(req);
+            let id = self.id.lock().clone();
+            return self.transition(DialogState::Confirmed(
+                id,
+                final_response.unwrap_or_default(),
+            ));
+        }
+        match final_response {
+            Some(resp) if resp.status_code.kind() == StatusCodeKind::Successful => {
+                let id = self.id.lock().clone();
+                warn!(%id, reinvite_cseq, "re-invite 2xx was never acknowledged");
+                *self.reinvite_ack.lock() = Some(ReinviteAck::TimedOut {
+                    cseq: reinvite_cseq,
+                });
+                self.transition(DialogState::Confirmed(id, resp))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// RFC 3261 §13.3.1.4: the server transaction of the initial INVITE
     /// retransmitted our 2xx (`answered_2xx`) for 64*T1 and ended without an
     /// ACK. The dialog is terminated with [`TerminatedReason::Timeout`] and the
-    /// session is ended with a BYE.
+    /// session is ended with a BYE. (A re-INVITE's missing ACK does not end
+    /// the session, see [`Self::await_reinvite_ack`].)
     pub(super) async fn end_session_without_ack(&self, tx: &Transaction, answered_2xx: bool) {
         if !answered_2xx
             || tx.state != crate::transaction::TransactionState::Terminated
@@ -1481,6 +1643,9 @@ impl DialogInner {
             supports_100rel: snapshot.supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
+            reinvite_ack: Mutex::new(None),
+            next_ack_body: Mutex::new(None),
+            last_sent_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
             dialback_target: Mutex::new(None),
         }))

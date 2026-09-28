@@ -171,6 +171,15 @@ pub struct Transaction {
     pub connection: Option<SipConnection>,
     pub last_response: Option<Response>,
     pub last_ack: Option<Request>,
+    /// Body for the 2xx ACK this client INVITE transaction builds: a UAC's
+    /// answer to an offer the 2xx brought (RFC 3261 §14.2). Set by the dialog
+    /// layer (`DialogInner::send_dialog_request`) from what the application
+    /// armed with `set_next_ack_body`; consumed by `send_ack`.
+    pub ack_body: Option<Vec<u8>>,
+    /// The ACK this client INVITE transaction sent. `last_ack` is taken by
+    /// `cleanup` for the detached late-2xx retransmission, so the dialog
+    /// layer reads this one.
+    pub sent_ack: Option<Request>,
     pub tu_receiver: TransactionEventReceiver,
     pub tu_sender: TransactionEventSender,
     pub timer_a: Option<u64>,
@@ -181,6 +190,10 @@ pub struct Transaction {
     pub timer_g: Option<u64>, // server invite only
     retransmission: bool,
     is_cleaned_up: bool,
+    /// Called once, on the first successful transport write of the request,
+    /// whichever send makes it (`send()` or a Timer A retransmission). See
+    /// [`Transaction::on_first_write`].
+    first_write_hook: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl Transaction {
@@ -211,6 +224,8 @@ impl Transaction {
             state,
             last_response: None,
             last_ack: None,
+            ack_body: None,
+            sent_ack: None,
             timer_a: None,
             timer_b: None,
             timer_c: None,
@@ -221,6 +236,7 @@ impl Transaction {
             tu_receiver,
             tu_sender,
             is_cleaned_up: false,
+            first_write_hook: None,
         };
         tx.endpoint_inner
             .attach_transaction(&tx.key, tx.tu_sender.clone());
@@ -318,10 +334,14 @@ impl Transaction {
         // so the transaction always enters the state machine (Calling) and
         // timers (Timer A / Timer B) handle retries and timeouts.
         let mut stream_failed = false;
+        let mut written = false;
         if let Some(connection) = self.connection.as_ref() {
-            if let Err(e) = connection.send(message, self.destination.as_ref()).await {
-                warn!(key = %self.key, error = %e, "send failed");
-                stream_failed = connection.is_stream();
+            match connection.send(message, self.destination.as_ref()).await {
+                Ok(()) => written = true,
+                Err(e) => {
+                    warn!(key = %self.key, error = %e, "send failed");
+                    stream_failed = connection.is_stream();
+                }
             }
         } else {
             debug!(key = %self.key, "no connection, will retry on timer");
@@ -331,10 +351,28 @@ impl Transaction {
         // even when transport is unavailable. Timer A will retry the send (and
         // redo the transport lookup if needed), and Timer B handles timeout.
         self.transition(TransactionState::Calling)?;
+        if written {
+            self.note_request_written();
+        }
         if stream_failed {
             self.on_stream_send_failure()?;
         }
         Ok(())
+    }
+
+    /// Register `hook` to run once, on the first successful transport write
+    /// of the request: in [`send`](Self::send), or in a Timer A
+    /// retransmission when the first send found no connection or failed.
+    /// `send()` returns `Ok` without writing in those cases, so this is the
+    /// "request is on the wire" signal. Register it before `send()`.
+    pub fn on_first_write(&mut self, hook: impl FnOnce() + Send + Sync + 'static) {
+        self.first_write_hook = Some(Box::new(hook));
+    }
+
+    fn note_request_written(&mut self) {
+        if let Some(hook) = self.first_write_hook.take() {
+            hook();
+        }
     }
 
     /// A write on a stream connection (TCP/TLS/WS) failed. Nothing will ever
@@ -349,9 +387,10 @@ impl Transaction {
                 .transport_layer
                 .retire_connection(connection);
         }
-        let response =
+        let mut response =
             self.endpoint_inner
                 .make_response(&self.original, StatusCode::ServiceUnavailable, None);
+        response.synthetic = true;
         self.inform_tu_response(response)
     }
 
@@ -532,7 +571,7 @@ impl Transaction {
                 ));
             }
         }
-        let ack = match self.last_ack.clone() {
+        let mut ack = match self.last_ack.clone() {
             Some(ack) => ack,
             None => match self.last_response {
                 Some(ref resp) => self.endpoint_inner.make_ack(&self.original, resp)?,
@@ -544,6 +583,29 @@ impl Transaction {
                 }
             },
         };
+        // A 2xx ACK carries the armed body: the UAC's answer to the offer the
+        // 2xx brought (RFC 3261 §14.2). Only a 2xx ACK consumes it: the ACK
+        // of a 401/407 must leave it for the authenticated retry.
+        let is_2xx = self
+            .last_response
+            .as_ref()
+            .is_some_and(|resp| resp.status_code.kind() == StatusCodeKind::Successful);
+        if is_2xx && ack.body.is_empty() {
+            if let Some(body) = self.ack_body.take() {
+                ack.headers.retain(|h| {
+                    !matches!(
+                        h,
+                        crate::sip::Header::ContentLength(_) | crate::sip::Header::ContentType(_)
+                    )
+                });
+                ack.headers
+                    .push(crate::sip::Header::ContentType("application/sdp".into()));
+                ack.headers.push(crate::sip::Header::ContentLength(
+                    (body.len() as u32).into(),
+                ));
+                ack.body = body;
+            }
+        }
 
         // Capture locator + transport lookup result
         // so before_send is called regardless of lookup outcome
@@ -602,7 +664,10 @@ impl Transaction {
         };
 
         match ack.clone() {
-            SipMessage::Request(ref ack_req) => self.last_ack.replace(ack_req.clone()),
+            SipMessage::Request(ref ack_req) => {
+                self.sent_ack = Some(ack_req.clone());
+                self.last_ack.replace(ack_req.clone())
+            }
             _ => None,
         };
 
@@ -769,9 +834,17 @@ impl Transaction {
 
     async fn on_received_response(
         &mut self,
-        resp: Response,
+        mut resp: Response,
         connection: Option<SipConnection>,
     ) -> Option<SipMessage> {
+        // Next to the packet source the endpoint stamped, record where this
+        // transaction actually sent its request (the resolved destination).
+        if let Some(provenance) = resp.received_from.as_mut() {
+            provenance.request_destination = self
+                .destination
+                .as_ref()
+                .and_then(|d| d.get_socketaddr().ok());
+        }
         match self.transaction_type {
             TransactionType::ServerInvite | TransactionType::ServerNonInvite => return None,
             _ => {}
@@ -810,7 +883,11 @@ impl Transaction {
         self.transition(new_state).ok();
 
         if is_completed_client_invite {
-            self.send_ack(connection).await.ok();
+            // A lost ACK is a dialog that never confirms (the far end
+            // retransmits its 2xx until its timer expires): leave a trace.
+            if let Err(e) = self.send_ack(connection).await {
+                warn!(key = %self.key, error = %e, "ACK for the final response could not be sent");
+            }
         }
 
         Some(SipMessage::Response(resp))
@@ -855,13 +932,16 @@ impl Transaction {
                             } else {
                                 self.original.to_owned().into()
                             };
-                            if let Err(e) = connection
+                            match connection
                                 .send(retry_message, self.destination.as_ref())
                                 .await
                             {
-                                warn!(key = %self.key, error = %e, "timer A resend failed");
-                                if connection.is_stream() {
-                                    return self.on_stream_send_failure();
+                                Ok(()) => self.note_request_written(),
+                                Err(e) => {
+                                    warn!(key = %self.key, error = %e, "timer A resend failed");
+                                    if connection.is_stream() {
+                                        return self.on_stream_send_failure();
+                                    }
                                 }
                             }
                         } else {
@@ -875,11 +955,12 @@ impl Transaction {
                             .timeout(duration, TransactionTimer::TimerA(key, duration));
                         self.timer_a.replace(timer_a);
                     } else if let TransactionTimer::TimerB(_) = timer {
-                        let timeout_response = self.endpoint_inner.make_response(
+                        let mut timeout_response = self.endpoint_inner.make_response(
                             &self.original,
                             StatusCode::RequestTimeout,
                             None,
                         );
+                        timeout_response.synthetic = true;
                         self.inform_tu_response(timeout_response)?;
                     }
                 }
@@ -887,11 +968,12 @@ impl Transaction {
             TransactionState::Proceeding => {
                 if let TransactionTimer::TimerC(_) = timer {
                     // Inform TU about timeout
-                    let timeout_response = self.endpoint_inner.make_response(
+                    let mut timeout_response = self.endpoint_inner.make_response(
                         &self.original,
                         StatusCode::RequestTimeout,
                         None,
                     );
+                    timeout_response.synthetic = true;
                     self.inform_tu_response(timeout_response)?;
                 }
             }

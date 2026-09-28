@@ -263,6 +263,135 @@ async fn test_dialog_removal() -> crate::Result<()> {
     Ok(())
 }
 
+/// `take_dialog` removes and returns the dialog in one operation: of several
+/// concurrent takers, exactly one gets it.
+#[tokio::test]
+async fn test_take_dialog_hands_the_dialog_to_exactly_one_caller() -> crate::Result<()> {
+    let endpoint = create_test_endpoint().await?;
+    let dialog_layer = std::sync::Arc::new(DialogLayer::new(endpoint.inner.clone()));
+    let mock_conn = create_mock_connection().await?;
+
+    let invite_req = create_invite_request("alice-tag-take", "", "call-id-take", "z9hG4bKtake");
+    let key = TransactionKey::from_request(&invite_req, TransactionRole::Server)?;
+    let tx = Transaction::new_server(key, invite_req, endpoint.inner.clone(), Some(mock_conn));
+    let (state_sender, _) = unbounded_channel();
+    let dialog = dialog_layer.get_or_create_server_invite(
+        &tx,
+        state_sender,
+        None,
+        Some(crate::sip::Uri::try_from("sip:bob@bob.example.com:5060")?),
+    )?;
+    let dialog_id = dialog.id();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let takers: Vec<_> = (0..8)
+        .map(|_| {
+            let layer = dialog_layer.clone();
+            let id = dialog_id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                layer.take_dialog(&id)
+            })
+        })
+        .collect();
+    let taken: Vec<_> = takers
+        .into_iter()
+        .filter_map(|t| t.join().expect("taker panicked"))
+        .collect();
+
+    assert_eq!(taken.len(), 1, "exactly one caller takes the dialog");
+    assert_eq!(taken[0].id(), dialog_id);
+    assert!(
+        dialog.cancel_token().is_cancelled(),
+        "a taken dialog is removed like remove_dialog removes it"
+    );
+    assert_eq!(dialog_layer.len(), 0);
+    assert!(dialog_layer.take_dialog(&dialog_id).is_none());
+    Ok(())
+}
+
+/// With a transparent Call-ID the inbound (UAS) and outbound (UAC) legs of a
+/// proxied call share it. Role-typed lookups must not hand out the other
+/// role's dialog.
+#[tokio::test]
+async fn test_lookups_keep_uac_and_uas_dialogs_apart() -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let tl = TransportLayer::new(token.child_token());
+    tl.add_transport(create_mock_connection().await?);
+    let endpoint = EndpointBuilder::new()
+        .with_user_agent("rsipstack-test")
+        .with_transport_layer(tl)
+        .build();
+    let dialog_layer = DialogLayer::new(endpoint.inner.clone());
+    let call_id = "shared-call-id";
+
+    // The inbound leg: a server dialog.
+    let invite_req = create_invite_request("caller-tag", "", call_id, "z9hG4bKinbound");
+    let key = TransactionKey::from_request(&invite_req, TransactionRole::Server)?;
+    let tx = Transaction::new_server(
+        key,
+        invite_req,
+        endpoint.inner.clone(),
+        Some(create_mock_connection().await?),
+    );
+    let (state_sender, _) = unbounded_channel();
+    let server = dialog_layer.get_or_create_server_invite(
+        &tx,
+        state_sender,
+        None,
+        Some(crate::sip::Uri::try_from("sip:bob@bob.example.com:5060")?),
+    )?;
+
+    // The outbound leg: a client dialog with the same Call-ID.
+    let (state_sender, _) = unbounded_channel();
+    let (client, _client_tx) = dialog_layer.create_client_invite_dialog(
+        crate::dialog::invitation::InviteOption {
+            caller: crate::sip::Uri::try_from("sip:alice@example.com")?,
+            callee: crate::sip::Uri::try_from("sip:carol@example.com")?,
+            contact: crate::sip::Uri::try_from("sip:alice@127.0.0.1:5060")?,
+            call_id: Some(call_id.to_string()),
+            ..Default::default()
+        },
+        state_sender,
+    )?;
+    assert_eq!(client.id().call_id, call_id);
+    dialog_layer.inner.dialogs.insert(
+        client.id().to_string(),
+        crate::dialog::dialog::Dialog::Invite(client.clone()),
+    );
+
+    let found = dialog_layer.get_client_dialog_by_call_id(call_id);
+    assert_eq!(found.len(), 1, "only the UAC dialog is a client dialog");
+    assert_eq!(found[0].role(), TransactionRole::Client);
+    assert_eq!(found[0].id(), client.id());
+    assert_eq!(server.role(), TransactionRole::Server);
+
+    // An in-dialog request whose id maps to a UAC dialog is not answered by
+    // it as a server dialog.
+    let in_dialog = create_invite_request("far-tag", "near-tag", call_id, "z9hG4bKreinvite");
+    let key = TransactionKey::from_request(&in_dialog, TransactionRole::Server)?;
+    let tx = Transaction::new_server(
+        key,
+        in_dialog,
+        endpoint.inner.clone(),
+        Some(create_mock_connection().await?),
+    );
+    let id = DialogId::try_from(&tx)?;
+    dialog_layer.inner.dialogs.insert(
+        id.to_string(),
+        crate::dialog::dialog::Dialog::Invite(client.clone()),
+    );
+    let (state_sender, _) = unbounded_channel();
+    assert!(
+        dialog_layer
+            .get_or_create_server_invite(&tx, state_sender, None, None)
+            .is_err(),
+        "a UAC dialog must not be returned as the server INVITE dialog"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_dialog_layer_with_swapped_tags() -> crate::Result<()> {
     let endpoint = create_test_endpoint().await?;

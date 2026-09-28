@@ -486,8 +486,28 @@ impl std::convert::From<Request> for Vec<u8> {
     }
 }
 
+/// Where a response received from the network came from. In-process
+/// provenance only: never serialized onto the wire, and a reparse of the
+/// response text drops it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct ReceivedFrom {
+    /// The packet's transport source address (stamped by the endpoint).
+    pub source: std::net::SocketAddr,
+    /// The address the client transaction actually sent the request to (its
+    /// resolved destination, after DNS), stamped by the transaction.
+    pub request_destination: Option<std::net::SocketAddr>,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Response {
+    /// `true` for a response the stack generated locally and delivered to
+    /// the transaction user in place of a received one (the Timer B/C 408,
+    /// the 503 for a failed stream write). Never serialized onto the wire;
+    /// parsed network responses are `false`.
+    pub synthetic: bool,
+    /// Where a response received from the network came from (see
+    /// [`ReceivedFrom`]); `None` for a parsed or locally built response.
+    pub received_from: Option<ReceivedFrom>,
     pub status_code: StatusCode,
     pub version: Version,
     pub headers: Headers,
@@ -561,6 +581,8 @@ impl HeadersExt for Response {}
 impl Default for Response {
     fn default() -> Self {
         Response {
+            synthetic: false,
+            received_from: None,
             status_code: StatusCode::OK,
             version: Version::V2,
             headers: Headers::default(),

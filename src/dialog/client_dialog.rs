@@ -177,10 +177,7 @@ impl ClientInviteDialog {
             self.inner
                 .make_request(crate::sip::Method::Bye, None, None, None, headers, None)?;
 
-        self.inner.do_request(request).await?;
-        self.inner
-            .transition(DialogState::Terminated(self.id(), TerminatedReason::UacBye))?;
-        Ok(())
+        self.inner.send_bye(request).await
     }
 
     /// Send a BYE request with a SIP `Reason` header.
@@ -314,6 +311,16 @@ impl ClientInviteDialog {
             self.inner
                 .make_request(crate::sip::Method::Invite, None, None, None, headers, body)?;
         self.inner.do_request(request).await
+    }
+
+    /// See [`InviteDialog::set_next_ack_body`](crate::dialog::invite_dialog::InviteDialog::set_next_ack_body).
+    pub fn set_next_ack_body(&self, body: Option<Vec<u8>>) {
+        *self.inner.next_ack_body.lock() = body;
+    }
+
+    /// See [`InviteDialog::last_sent_ack`](crate::dialog::invite_dialog::InviteDialog::last_sent_ack).
+    pub fn last_sent_ack(&self) -> Option<crate::sip::Request> {
+        self.inner.last_sent_ack.lock().clone()
     }
 
     /// Send an UPDATE request to modify session parameters
@@ -716,8 +723,16 @@ impl ClientInviteDialog {
         &self,
         tx: &mut Transaction,
     ) -> Result<(DialogId, Option<Response>)> {
-        self.inner.transition(DialogState::Calling(self.id()))?;
         let mut auth_sent = false;
+        // `Calling` is the "INVITE is on the wire" signal: notified once, on
+        // the first successful transport write, whether that is this send or
+        // a Timer A retransmission after it found no connection. A send that
+        // never reaches the wire notifies nothing. The stored state is
+        // `Calling` from construction, so only the notification moves.
+        let (inner, id) = (self.inner.clone(), self.id());
+        tx.on_first_write(move || {
+            inner.transition(DialogState::Calling(id)).ok();
+        });
         tx.send().await?;
         let mut dialog_id = self.id();
         let mut final_response = None;
@@ -803,19 +818,7 @@ impl ClientInviteDialog {
                             self.inner.update_route_set_from_response(&resp);
                         }
                         StatusCode::OK => {
-                            self.inner.update_route_set_from_response(&resp);
-                            // 200 response to INVITE always contains Contact header
-                            let contact = resp.contact_header()?;
-                            self.inner.remote_contact.lock().replace(contact.clone());
-
-                            let contact_uri = resp
-                                .typed_contact_headers()?
-                                .first()
-                                .map(|c| c.uri.clone())
-                                .ok_or_else(|| {
-                                    crate::Error::Error("missing Contact header".to_string())
-                                })?;
-                            *self.inner.remote_uri.lock() = contact_uri;
+                            self.inner.adopt_2xx_remote_target(&resp)?;
                             self.inner
                                 .transition(DialogState::Confirmed(dialog_id.clone(), resp))?;
                         }

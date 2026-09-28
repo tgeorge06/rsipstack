@@ -178,6 +178,8 @@ async fn client_learns_remote_uuid_from_response() -> crate::Result<()> {
     // Simulate receiving 200 OK from the peer carrying {B, A}.
     let resp_header = make_header("Session-ID", format!("{};remote={}", UUID_B, UUID_A));
     let mut resp = crate::sip::Response {
+        synthetic: false,
+        received_from: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: Default::default(),
@@ -267,6 +269,8 @@ async fn make_ack_swaps_remote_uuid_from_response() -> crate::Result<()> {
         .replace("SIP/2.0/UDP alice.example.com:5060;branch=z9hG4bKnashds");
 
     let resp = crate::sip::Response {
+        synthetic: false,
+        received_from: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: vec![
@@ -297,6 +301,8 @@ async fn make_ack_without_session_id_untouched() -> crate::Result<()> {
     let endpoint = create_test_endpoint().await?;
     let invite = create_invite_request("alice-tag", "", "ack-test");
     let resp = crate::sip::Response {
+        synthetic: false,
+        received_from: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: vec![crate::sip::headers::Contact::new("<sip:bob@bob.example.com:5060>").into()]
@@ -316,6 +322,8 @@ async fn session_id_survives_snapshot_restore() -> crate::Result<()> {
 
     let peer = make_header("Session-ID", format!("{};remote={}", UUID_B, UUID_A));
     let mut resp = crate::sip::Response {
+        synthetic: false,
+        received_from: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: Default::default(),
@@ -587,6 +595,8 @@ fn ok_response_with(headers: Vec<Header>) -> crate::sip::Response {
     let mut headers = headers;
     headers.push(crate::sip::headers::Contact::new("<sip:bob@bob.example.com:5060>").into());
     crate::sip::Response {
+        synthetic: false,
+        received_from: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: headers.into(),

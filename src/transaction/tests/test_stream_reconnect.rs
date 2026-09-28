@@ -90,10 +90,14 @@ fn make_request(
 }
 
 async fn final_status(tx: &mut Transaction) -> Option<StatusCode> {
+    final_response(tx).await.map(|resp| resp.status_code)
+}
+
+async fn final_response(tx: &mut Transaction) -> Option<crate::sip::Response> {
     while let Some(msg) = tx.receive().await {
         if let SipMessage::Response(resp) = msg {
             if resp.status_code.kind() != crate::sip::StatusCodeKind::Provisional {
-                return Some(resp.status_code);
+                return Some(resp);
             }
         }
     }
@@ -202,23 +206,29 @@ async fn test_send_failure_on_stream_is_reported_at_once() -> Result<()> {
             let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
             let mut tx = Transaction::new_client(key, request, inner.clone(), Some(dead));
             tx.send().await?;
-            let status = tokio::time::timeout(Duration::from_secs(2), final_status(&mut tx))
+            let resp = tokio::time::timeout(Duration::from_secs(2), final_response(&mut tx))
                 .await
                 .unwrap_or(None);
-            Ok::<_, crate::Error>(status)
+            Ok::<_, crate::Error>(resp)
         };
 
-        let status = tokio::select! {
+        let resp = tokio::select! {
             r = client => r?,
             _ = endpoint.serve() => panic!("endpoint stopped"),
         };
         peer_task.abort();
         assert_eq!(
-            status,
+            resp.as_ref().map(|r| r.status_code.clone()),
             Some(StatusCode::ServiceUnavailable),
             "a failed {method} write on a stream connection must be reported to the TU, \
              not left to time out"
         );
+        let resp = resp.unwrap();
+        assert!(
+            resp.synthetic,
+            "the 503 for a failed {method} write is generated locally, not received"
+        );
+        assert_eq!(resp.received_from, None);
     }
     Ok(())
 }

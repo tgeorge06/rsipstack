@@ -72,6 +72,29 @@ impl InviteDialog {
         self.inner.remote_ack.lock().clone()
     }
 
+    /// Arm the body the NEXT in-dialog INVITE's 2xx ACK carries: a UAC's
+    /// answer to an offer the 2xx brings, e.g. after an offerless re-INVITE
+    /// (RFC 3261 §14.2). Consumed by that one request; `None` disarms it.
+    pub fn set_next_ack_body(&self, body: Option<Vec<u8>>) {
+        *self.inner.next_ack_body.lock() = body;
+    }
+
+    /// The last 2xx ACK this dialog sent for an in-dialog INVITE (UAC role),
+    /// or `None` if none was sent yet.
+    pub fn last_sent_ack(&self) -> Option<Request> {
+        self.inner.last_sent_ack.lock().clone()
+    }
+
+    /// How the most recent re-INVITE this dialog answered ended: its
+    /// CSeq-correlated ACK (with the body a UAC puts there when our 2xx
+    /// carried the offer), or no ACK before the transaction ended. Taken
+    /// once; `None` when nothing is pending. Read it on the `Confirmed`
+    /// state that follows the re-INVITE and match its CSeq against the
+    /// `Confirmed` response's.
+    pub fn take_reinvite_ack(&self) -> Option<super::dialog::ReinviteAck> {
+        self.inner.reinvite_ack.lock().take()
+    }
+
     /// The initial INVITE request that created this dialog.
     pub fn initial_request(&self) -> Request {
         self.inner.initial_request.lock().clone()
@@ -264,8 +287,16 @@ impl InviteDialog {
         }
         use super::authenticate::handle_client_authenticate;
 
-        self.inner.transition(DialogState::Calling(self.id()))?;
         let mut auth_sent = false;
+        // `Calling` is the "INVITE is on the wire" signal: notified once, on
+        // the first successful transport write, whether that is this send or
+        // a Timer A retransmission after it found no connection. A send that
+        // never reaches the wire notifies nothing. The stored state is
+        // `Calling` from construction, so only the notification moves.
+        let (inner, id) = (self.inner.clone(), self.id());
+        tx.on_first_write(move || {
+            inner.transition(DialogState::Calling(id)).ok();
+        });
         tx.send().await?;
         // Record the flow the INVITE actually went out on, so later
         // in-dialog requests (BYE / re-INVITE / INFO) reuse it instead of
@@ -369,19 +400,11 @@ impl InviteDialog {
         Ok((dialog_id, final_response))
     }
 
-    /// Take the route set, Contact and remote target from a 2xx to the INVITE.
+    /// Take the route set, Contact and remote target from a 2xx to the
+    /// INVITE, keeping an established `;transport=` (see
+    /// `DialogInner::adopt_2xx_remote_target`).
     fn update_remote_target_from_2xx(&self, resp: &Response) -> Result<()> {
-        self.inner.update_route_set_from_response(resp);
-        let contact = resp.contact_header()?;
-        self.inner.remote_contact.lock().replace(contact.clone());
-
-        let contact_uri = resp
-            .typed_contact_headers()?
-            .first()
-            .map(|c| c.uri.clone())
-            .ok_or_else(|| crate::Error::Error("missing Contact header".to_string()))?;
-        *self.inner.remote_uri.lock() = contact_uri;
-        Ok(())
+        self.inner.adopt_2xx_remote_target(resp)
     }
 
     /// End the session a 2xx established after we cancelled the INVITE.
@@ -416,8 +439,14 @@ impl InviteDialog {
     /// dialogs remain a silent no-op.
     ///
     /// # Returns
-    /// * `Ok(())` - BYE was sent successfully or dialog is already terminated.
-    /// * `Err(Error)` - Failed to build/send BYE request, or dialog is in a state where BYE does not apply.
+    /// * `Ok(())` - BYE was sent (or, for a UAC, attempted) or the dialog is
+    ///   already terminated.
+    /// * `Err(Error)` - Failed to build the BYE, the dialog is in a state
+    ///   where BYE does not apply, or (UAS) the BYE could not be sent.
+    ///
+    /// `Terminated` is notified even when the BYE fails: a UAS notifies it
+    /// before sending, a UAC once the BYE transaction ends (see
+    /// `DialogInner::send_bye`).
     pub async fn bye_with_headers(&self, headers: Option<Vec<Header>>) -> Result<()> {
         let confirmed_or_waiting_ack = self.inner.is_confirmed()
             || (self.role() == TransactionRole::Server && self.inner.waiting_ack());
@@ -441,14 +470,7 @@ impl InviteDialog {
             .inner
             .make_request(Method::Bye, None, None, None, headers, None)?;
 
-        self.inner.do_request(request).await?;
-        let reason = match self.role() {
-            TransactionRole::Server => TerminatedReason::UasBye,
-            TransactionRole::Client => TerminatedReason::UacBye,
-        };
-        self.inner
-            .transition(DialogState::Terminated(self.id(), reason))?;
-        Ok(())
+        self.inner.send_bye(request).await
     }
 
     /// Send a BYE request with a SIP `Reason` header.
@@ -838,26 +860,7 @@ impl InviteDialog {
             .transition(DialogState::Updated(self.id(), tx.original.clone(), handle))?;
 
         self.inner.process_transaction_handle(tx, rx).await?;
-        let answered_2xx = tx
-            .last_response
-            .as_ref()
-            .is_some_and(|resp| resp.status_code.kind() == StatusCodeKind::Successful);
-
-        while let Some(msg) = tx.receive().await {
-            if let SipMessage::Request(req) = msg {
-                if req.method == Method::Ack {
-                    debug!(id = %self.id(), "received ack for re-invite {}", req.uri);
-                    self.inner.remote_ack.lock().replace(req);
-                    self.inner.transition(DialogState::Confirmed(
-                        self.id(),
-                        tx.last_response.clone().unwrap_or_default(),
-                    ))?;
-                    break;
-                }
-            }
-        }
-        self.inner.end_session_without_ack(tx, answered_2xx).await;
-        Ok(())
+        self.inner.await_reinvite_ack(tx).await
     }
 
     async fn handle_invite(&mut self, tx: &mut Transaction) -> Result<()> {
