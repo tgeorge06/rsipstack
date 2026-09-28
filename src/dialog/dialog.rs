@@ -129,16 +129,49 @@ pub enum DialogState {
     Terminated(DialogId, TerminatedReason),
 }
 
-/// How the re-INVITE transaction on an established dialog ended: the ACK
-/// correlated to the re-INVITE by CSeq, with the body a UAC puts there when
-/// the 2xx carried the offer (RFC 3261 §14.2), or no ACK before the
-/// transaction ended after a 2xx. Read with
-/// [`InviteDialog::take_reinvite_ack`](crate::dialog::invite_dialog::InviteDialog::take_reinvite_ack)
-/// after the `Confirmed` state the dialog notifies for it.
+/// How the re-INVITE transaction on an established dialog ended. Read with
+/// [`InviteDialog::take_reinvite_ack`](crate::dialog::invite_dialog::InviteDialog::take_reinvite_ack):
+///
+/// * [`ReinviteAck::Received`]: the ACK correlated to the re-INVITE by CSeq,
+///   with the body a UAC puts there when the 2xx carried the offer (RFC 3261
+///   §14.2). Stored before the `Confirmed` state notified for it; read it on
+///   that `Confirmed`.
+/// * [`ReinviteAck::TimedOut`]: no ACK within 64*T1 after a 2xx. The session
+///   is ended (RFC 3261 §13.3.1.4); stored before `Terminated(Timeout)` is
+///   notified, read it on that `Terminated`. No `Confirmed` is notified for
+///   it. It is final: an outcome of another re-INVITE transaction still
+///   outstanding never replaces it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReinviteAck {
     Received { cseq: u32, body: Option<Vec<u8>> },
     TimedOut { cseq: u32 },
+}
+
+/// The last [`ReinviteAck`] of a dialog, with the rule that a `TimedOut`
+/// (which ends the session) is final.
+#[derive(Debug, Default)]
+pub(super) struct ReinviteAckSlot {
+    outcome: Option<ReinviteAck>,
+    /// A `TimedOut` was stored: later outcomes are ignored.
+    frozen: bool,
+}
+
+impl ReinviteAckSlot {
+    pub(super) fn store(&mut self, outcome: ReinviteAck) {
+        if self.frozen {
+            debug!(
+                ?outcome,
+                "re-invite outcome ignored: the session already timed out"
+            );
+            return;
+        }
+        self.frozen = matches!(outcome, ReinviteAck::TimedOut { .. });
+        self.outcome = Some(outcome);
+    }
+
+    pub(super) fn take(&mut self) -> Option<ReinviteAck> {
+        self.outcome.take()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -349,7 +382,7 @@ pub struct DialogInner {
     pub(super) remote_ack: Mutex<Option<Request>>,
     /// The outcome of the last re-INVITE transaction this dialog answered,
     /// see [`ReinviteAck`]. Taken by `InviteDialog::take_reinvite_ack`.
-    pub(super) reinvite_ack: Mutex<Option<ReinviteAck>>,
+    pub(super) reinvite_ack: Mutex<ReinviteAckSlot>,
     /// UAC side: the body the NEXT in-dialog INVITE's 2xx ACK carries (the
     /// answer to an offer in that 2xx, RFC 3261 §14.2), consumed by that one
     /// request. Armed with `InviteDialog::set_next_ack_body`.
@@ -522,7 +555,7 @@ impl DialogInner {
             supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
-            reinvite_ack: Mutex::new(None),
+            reinvite_ack: Mutex::new(ReinviteAckSlot::default()),
             next_ack_body: Mutex::new(None),
             last_sent_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
@@ -1466,7 +1499,7 @@ impl DialogInner {
                 continue;
             }
             debug!(id = %self.id.lock(), "received ack for re-invite {}", req.uri);
-            *self.reinvite_ack.lock() = Some(ReinviteAck::Received {
+            self.reinvite_ack.lock().store(ReinviteAck::Received {
                 cseq: ack_cseq,
                 body: (!req.body.is_empty()).then(|| req.body.clone()),
             });
@@ -1483,7 +1516,7 @@ impl DialogInner {
         if answered_2xx {
             let id = self.id.lock().clone();
             warn!(%id, reinvite_cseq, "re-invite 2xx was never acknowledged");
-            *self.reinvite_ack.lock() = Some(ReinviteAck::TimedOut {
+            self.reinvite_ack.lock().store(ReinviteAck::TimedOut {
                 cseq: reinvite_cseq,
             });
         }
@@ -1649,7 +1682,7 @@ impl DialogInner {
             supports_100rel: snapshot.supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
-            reinvite_ack: Mutex::new(None),
+            reinvite_ack: Mutex::new(ReinviteAckSlot::default()),
             next_ack_body: Mutex::new(None),
             last_sent_ack: Mutex::new(None),
             server_connection: Mutex::new(None),

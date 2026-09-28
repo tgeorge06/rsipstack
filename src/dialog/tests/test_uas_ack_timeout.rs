@@ -883,3 +883,54 @@ async fn test_2xx_over_tcp_is_retransmitted_until_the_ack() -> crate::Result<()>
     token.cancel();
     Ok(())
 }
+
+/// Two re-INVITE transactions are outstanding. The first (CSeq 2) times out
+/// and ends the session; the ACK of the second (CSeq 3) arrives after that.
+/// The terminal `TimedOut { cseq: 2 }` must still be what the consumer reads.
+#[tokio::test]
+async fn test_reinvite_timeout_outcome_is_not_replaced_by_a_later_ack() -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let (mut states, mut dialogs, peer) = setup(&token, short_timers()).await?;
+    let (dialog, local_tag, answered) = answer_reinvite(&mut states, &mut dialogs, &peer).await?;
+
+    // Half-way through re-INVITE 2's wait, the peer sends re-INVITE 3.
+    peer.collect(answered + T1X64 / 2).await;
+    peer.send_request(Method::Invite, 3, Some(&local_tag)).await;
+    let handle = loop {
+        let state = tokio::time::timeout(Duration::from_secs(2), states.recv())
+            .await
+            .expect("timeout waiting for re-INVITE 3")
+            .expect("state channel closed");
+        if let DialogState::Updated(_, _, handle) = state {
+            break handle;
+        }
+    };
+    handle.reply(crate::sip::StatusCode::OK).await.ok();
+
+    // Re-INVITE 2 times out: BYE and Terminated(Timeout).
+    let messages = peer.collect(answered + T1X64 + T1 * 10).await;
+    assert!(
+        messages.iter().any(|(_, m)| matches!(
+            m,
+            SipMessage::Request(req) if req.method == Method::Bye
+        )),
+        "re-INVITE 2's missing ACK must end the session"
+    );
+    // Re-INVITE 3's transaction is still waiting; its ACK arrives now.
+    peer.send_request(Method::Ack, 3, Some(&local_tag)).await;
+    peer.collect(Instant::now() + T1 * 10).await;
+
+    let seen = drain(&mut states);
+    assert!(
+        seen.iter()
+            .any(|s| matches!(s, DialogState::Terminated(_, TerminatedReason::Timeout))),
+        "got {seen:?}"
+    );
+    assert_eq!(
+        dialog.take_reinvite_ack(),
+        Some(ReinviteAck::TimedOut { cseq: 2 }),
+        "the timeout that ended the session must not be replaced"
+    );
+    token.cancel();
+    Ok(())
+}

@@ -85,12 +85,12 @@ impl InviteDialog {
         self.inner.last_sent_ack.lock().clone()
     }
 
-    /// How the most recent re-INVITE this dialog answered ended: its
-    /// CSeq-correlated ACK (with the body a UAC puts there when our 2xx
-    /// carried the offer), or no ACK before the transaction ended. Taken
-    /// once; `None` when nothing is pending. Read it on the `Confirmed`
-    /// state that follows the re-INVITE and match its CSeq against the
-    /// `Confirmed` response's.
+    /// How the most recent re-INVITE this dialog answered ended (see
+    /// [`ReinviteAck`](super::dialog::ReinviteAck)). Taken once; `None` when
+    /// nothing is pending. Read `Received` on the `Confirmed` state that
+    /// follows the re-INVITE (match its CSeq against the `Confirmed`
+    /// response's), and `TimedOut` on `Terminated(Timeout)`. A `TimedOut`
+    /// is final: no later re-INVITE outcome replaces it.
     pub fn take_reinvite_ack(&self) -> Option<super::dialog::ReinviteAck> {
         self.inner.reinvite_ack.lock().take()
     }

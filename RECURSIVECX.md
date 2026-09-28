@@ -72,6 +72,9 @@ too.
   INVITE (`DialogInner::end_session_without_ack`, fork PR #11), on UAS and
   UAC dialogs alike:
   1. `ReinviteAck::TimedOut { cseq }` is stored, so a consumer can tell why.
+     Read it on `Terminated(Timeout)`. It is final: an outcome of another
+     re-INVITE transaction still outstanding (e.g. its late ACK) never
+     replaces it. A `Received` is read on the `Confirmed` it precedes.
   2. `Terminated(Timeout)` is notified.
   3. A BYE is sent. It is built before the notification and sent after it,
      so `Terminated` does not wait for the BYE's response.
@@ -93,6 +96,18 @@ too.
     deprecated `ClientInviteDialog`'s now shares it). A callee's re-INVITE to
     rcx notifies `Confirmed` after its ACK, or ends the call when no ACK
     comes. The vendor's `ClientInviteDialog` did neither.
+- **2xx retransmission on every transport.** RFC 3261 §13.3.1.4: the 2xx
+  to an INVITE or re-INVITE is retransmitted (T1 doubling, capped at T2,
+  until the ACK or 64*T1) over TCP/TLS/WS too, since it can be lost at a
+  later UDP hop. Before this, Timer G ran on unreliable transports only, and
+  with the no-ACK teardown one lost 2xx would drop the call. A non-2xx final
+  keeps §17.2.1: retransmitted on unreliable transports only.
+- **Glare (§14.1/§14.2) is the consumer's job.** The fork does not answer a
+  re-INVITE with 491, or with 500 + Retry-After, while another INVITE
+  transaction is in progress. It delivers every re-INVITE to the
+  transaction user (`DialogState::Updated`), and recursivecx enforces the
+  rule in its UA core (`accept_confirm.rs`, `dialing.rs`, `signaling.rs`).
+  A stack-level gate would answer twice.
 - **rcx:** `sip_session/dialog_events.rs` (`Confirmed` arm → `take_reinvite_ack`;
   `Terminated` arm), `sip_session/caller_reoffer.rs` `settle_caller_reoffer`,
   `renegotiation_tests.rs`, `queue_external_ring_accept_e2e_test`.
@@ -105,6 +120,8 @@ too.
     - `test_mismatched_ack_does_not_stop_the_reinvite_teardown`
     - `test_acked_reinvite_keeps_the_call_up`
     - `test_2xx_retransmission_interval_doubles_up_to_t2`
+    - `test_2xx_over_tcp_is_retransmitted_until_the_ack`
+    - `test_reinvite_timeout_outcome_is_not_replaced_by_a_later_ack`
 
 ## 5. Client-side 2xx ACK body and last-sent ACK (rcx PR #769): carried
 
@@ -261,7 +278,7 @@ rcx depends on, so the 0.5.16 behavior was put back on this branch.
 ## Other fork behavior rcx will observe (not vendored patches)
 
 - A server INVITE 2xx is retransmitted until 64*T1 (Timer K removed for
-  that case, fork PR #11). Following RFC 3261 §13.3.1.4, an INVITE whose 2xx
+  that case, fork PR #11), on every transport, reliable ones included. Following RFC 3261 §13.3.1.4, an INVITE whose 2xx
   is never ACKed ends with `Terminated(Timeout)` + BYE. That covers the
   initial INVITE and, since `fix/rfc3261-reinvite-ack-timeout`, a re-INVITE
   on either role (see patch 4). The call is no longer kept up.
