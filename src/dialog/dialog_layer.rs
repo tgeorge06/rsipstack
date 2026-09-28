@@ -157,7 +157,12 @@ impl DialogLayer {
         if !id.local_tag.is_empty() {
             let dlg = self.inner.dialogs.get(&id.to_string()).map(|d| d.clone());
             match dlg {
-                Some(Dialog::Invite(dlg)) => return Ok(dlg),
+                // Only a UAS dialog answers an in-dialog request here, as the
+                // role-typed `Dialog::ServerInvite` did before the unified
+                // `InviteDialog`.
+                Some(Dialog::Invite(dlg)) if dlg.role() == TransactionRole::Server => {
+                    return Ok(dlg)
+                }
                 _ => {
                     return Err(crate::Error::DialogError(
                         "the dialog not found".to_string(),
@@ -459,7 +464,12 @@ impl DialogLayer {
             .dialogs
             .iter()
             .filter_map(|e| match e.value() {
-                Dialog::Invite(client_dlg) if client_dlg.id().call_id == call_id => {
+                // UAC dialogs only: with a transparent Call-ID, the inbound
+                // (UAS) leg of a proxied call shares it.
+                Dialog::Invite(client_dlg)
+                    if client_dlg.role() == TransactionRole::Client
+                        && client_dlg.id().call_id == call_id =>
+                {
                     Some(client_dlg.clone())
                 }
                 _ => None,
