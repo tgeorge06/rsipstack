@@ -376,10 +376,7 @@ impl ServerInviteDialog {
             self.inner
                 .make_request(crate::sip::Method::Bye, None, None, None, headers, None)?;
 
-        self.inner.do_request(request).await?;
-        self.inner
-            .transition(DialogState::Terminated(self.id(), TerminatedReason::UasBye))?;
-        Ok(())
+        self.inner.send_bye(request).await
     }
 
     /// Send a BYE request with a SIP `Reason` header.

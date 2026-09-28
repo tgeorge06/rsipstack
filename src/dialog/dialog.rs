@@ -1399,6 +1399,30 @@ impl DialogInner {
         self.send_dialog_request(request).boxed().await
     }
 
+    /// Send the BYE that ends this dialog and notify `Terminated`, with the
+    /// lifecycle subscribers rely on to finish their teardown:
+    ///
+    /// * UAS: `Terminated(UasBye)` is notified before the BYE is sent, so it
+    ///   never waits for the BYE's response; the send result is returned.
+    /// * UAC: the BYE transaction runs, then `Terminated(UacBye)` is notified
+    ///   whatever its outcome. A failed send is logged and the dialog still
+    ///   ends locally; `Ok` is returned.
+    pub(super) async fn send_bye(&self, request: Request) -> Result<()> {
+        let id = self.id.lock().clone();
+        match self.role {
+            TransactionRole::Server => {
+                self.transition(DialogState::Terminated(id, TerminatedReason::UasBye))?;
+                self.do_request(request).await.map(|_| ())
+            }
+            TransactionRole::Client => {
+                if let Err(e) = self.do_request(request).await {
+                    info!(%id, error = %e, "bye error, ending the dialog locally");
+                }
+                self.transition(DialogState::Terminated(id, TerminatedReason::UacBye))
+            }
+        }
+    }
+
     /// Wait for the ACK of a re-INVITE this dialog answered, until the
     /// server transaction ends.
     ///

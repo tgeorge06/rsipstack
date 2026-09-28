@@ -439,8 +439,14 @@ impl InviteDialog {
     /// dialogs remain a silent no-op.
     ///
     /// # Returns
-    /// * `Ok(())` - BYE was sent successfully or dialog is already terminated.
-    /// * `Err(Error)` - Failed to build/send BYE request, or dialog is in a state where BYE does not apply.
+    /// * `Ok(())` - BYE was sent (or, for a UAC, attempted) or the dialog is
+    ///   already terminated.
+    /// * `Err(Error)` - Failed to build the BYE, the dialog is in a state
+    ///   where BYE does not apply, or (UAS) the BYE could not be sent.
+    ///
+    /// `Terminated` is notified even when the BYE fails: a UAS notifies it
+    /// before sending, a UAC once the BYE transaction ends (see
+    /// `DialogInner::send_bye`).
     pub async fn bye_with_headers(&self, headers: Option<Vec<Header>>) -> Result<()> {
         let confirmed_or_waiting_ack = self.inner.is_confirmed()
             || (self.role() == TransactionRole::Server && self.inner.waiting_ack());
@@ -464,14 +470,7 @@ impl InviteDialog {
             .inner
             .make_request(Method::Bye, None, None, None, headers, None)?;
 
-        self.inner.do_request(request).await?;
-        let reason = match self.role() {
-            TransactionRole::Server => TerminatedReason::UasBye,
-            TransactionRole::Client => TerminatedReason::UacBye,
-        };
-        self.inner
-            .transition(DialogState::Terminated(self.id(), reason))?;
-        Ok(())
+        self.inner.send_bye(request).await
     }
 
     /// Send a BYE request with a SIP `Reason` header.
