@@ -84,6 +84,14 @@ fn drain_states(rx: &mut DialogStateReceiver) -> Vec<DialogState> {
 pub(super) async fn establish(
     token: &CancellationToken,
 ) -> crate::Result<(InviteDialog, DialogStateReceiver, UdpSocket)> {
+    establish_with_credential(token, None).await
+}
+
+/// [`establish`], with `credential` set on the dialog for later challenges.
+pub(super) async fn establish_with_credential(
+    token: &CancellationToken,
+    credential: Option<crate::dialog::authenticate::Credential>,
+) -> crate::Result<(InviteDialog, DialogStateReceiver, UdpSocket)> {
     let peer = UdpSocket::bind("127.0.0.1:0").await?;
     let peer_port = peer.local_addr()?.port();
 
@@ -112,6 +120,7 @@ pub(super) async fn establish(
         caller: Uri::try_from("sip:alice@example.com")?,
         callee: Uri::try_from(format!("sip:bob@127.0.0.1:{peer_port};transport=udp").as_str())?,
         contact: Uri::try_from(format!("sip:alice@{uac_addr}").as_str())?,
+        credential,
         ..Default::default()
     };
     let invite = tokio::spawn(async move {

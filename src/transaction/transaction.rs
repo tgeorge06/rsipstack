@@ -572,13 +572,14 @@ impl Transaction {
             },
         };
         // A 2xx ACK carries the armed body: the UAC's answer to the offer the
-        // 2xx brought (RFC 3261 §14.2).
-        if let Some(body) = self.ack_body.take() {
-            let is_2xx = self
-                .last_response
-                .as_ref()
-                .is_some_and(|resp| resp.status_code.kind() == StatusCodeKind::Successful);
-            if is_2xx && ack.body.is_empty() {
+        // 2xx brought (RFC 3261 §14.2). Only a 2xx ACK consumes it: the ACK
+        // of a 401/407 must leave it for the authenticated retry.
+        let is_2xx = self
+            .last_response
+            .as_ref()
+            .is_some_and(|resp| resp.status_code.kind() == StatusCodeKind::Successful);
+        if is_2xx && ack.body.is_empty() {
+            if let Some(body) = self.ack_body.take() {
                 ack.headers.retain(|h| {
                     !matches!(
                         h,
