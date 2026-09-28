@@ -779,7 +779,7 @@ async fn test_2xx_over_tcp_is_retransmitted_until_the_ack() -> crate::Result<()>
         .local_addr()?
         .port();
     let uas: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let tcp = TcpListenerConnection::new(uas.into(), None).await?;
+    let tcp = TcpListenerConnection::new(uas, None).await?;
     transport_layer.add_transport(tcp.into());
     let endpoint = EndpointBuilder::new()
         .with_user_agent("rsipstack-test")
