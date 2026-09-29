@@ -282,6 +282,15 @@ rcx depends on, so the 0.5.16 behavior was put back on this branch.
   is never ACKed ends with `Terminated(Timeout)` + BYE. That covers the
   initial INVITE and, since `fix/rfc3261-reinvite-ack-timeout`, a re-INVITE
   on either role (see patch 4). The call is no longer kept up.
+- Upstream 3ea35cd (merged in the 0.6.12 sync): a client INVITE 2xx whose
+  Via names another hop (a forwarded request, i.e. a proxy) gets no automatic
+  ACK, is delivered to the TU on every retransmission and fork, and never
+  replays a cached ACK; the transaction stays `Completed` until the first
+  Timer D. The UA path is unchanged: the dialog layer builds every request
+  with a single Via, so rcx's legs keep the fork's 2xx ACK (armed body,
+  `sent_ack`, the 2xx-after-CANCEL ACK + BYE, late-2xx ACK replay). Upstream's
+  test compares the delivered response after clearing the fork's
+  `received_from` stamp.
 - `Response` has two new public fields. Struct literals must set
   `synthetic: false, received_from: None` (rcx's tests already do).
 - `Dialog::ClientInvite` / `Dialog::ServerInvite` are now `Dialog::Invite(InviteDialog)`.
