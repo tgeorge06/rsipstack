@@ -1,3 +1,4 @@
+use crate::prelude::*;
 use super::{
     authenticate::{handle_client_authenticate, Credential},
     invite_dialog::InviteDialog,
@@ -22,17 +23,14 @@ use crate::{
     Result,
 };
 use futures::FutureExt;
-use parking_lot::Mutex;
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
-};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio_util::sync::CancellationToken;
+use crate::platform::sync::Mutex;
+use core::sync::atomic::{AtomicU32, Ordering};
+use crate::platform::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use crate::platform::CancellationToken;
 use tracing::{debug, info, warn};
 
-pub type TransactionCommandSender = mpsc::Sender<TransactionCommand>;
-pub type TransactionCommandReceiver = mpsc::Receiver<TransactionCommand>;
+pub type TransactionCommandSender = crate::platform::BoundedSender<TransactionCommand>;
+pub type TransactionCommandReceiver = crate::platform::BoundedReceiver<TransactionCommand>;
 #[derive(Debug)]
 pub enum TransactionCommand {
     Respond {
@@ -56,7 +54,7 @@ impl TransactionHandle {
     pub async fn reply(
         &self,
         status: StatusCode,
-    ) -> std::result::Result<(), mpsc::error::SendError<TransactionCommand>> {
+    ) -> core::result::Result<(), mpsc::error::SendError<TransactionCommand>> {
         self.respond(status, None, None).await
     }
 
@@ -65,7 +63,7 @@ impl TransactionHandle {
         status: StatusCode,
         headers: Option<Vec<crate::sip::Header>>,
         body: Option<Vec<u8>>,
-    ) -> std::result::Result<(), mpsc::error::SendError<TransactionCommand>> {
+    ) -> core::result::Result<(), mpsc::error::SendError<TransactionCommand>> {
         self.sender
             .send(TransactionCommand::Respond {
                 status,
@@ -226,7 +224,7 @@ impl ReferStatus {
         let sub_state = sub_state?;
         let is_terminated = sub_state.contains("terminated");
 
-        let body = std::str::from_utf8(&req.body).ok()?;
+        let body = core::str::from_utf8(&req.body).ok()?;
         let status_line = body.lines().find(|l| l.starts_with("SIP/2.0"))?;
         let parts: Vec<&str> = status_line.split_whitespace().collect();
         if parts.len() < 2 {
@@ -1762,6 +1760,17 @@ impl DialogInner {
         }
     }
     pub(super) fn transition(&self, state: DialogState) -> Result<()> {
+        // Decide under the state lock and notify only transitions that are
+        // applied, while still holding it, so notifications follow the order
+        // in which the state changed.
+        let mut old_state = self.state.lock();
+        // Late updates after termination (e.g. CANCEL's 200 arriving after
+        // the INVITE's 487, or a second Terminated from a racing teardown)
+        // are neither applied nor broadcast: observers already saw Terminated.
+        if let DialogState::Terminated(id, _) = &*old_state {
+            debug!(id = %id, target = %state, "dialog already terminated, ignoring late transition");
+            return Ok(());
+        }
         // In-dialog request events do not change the established lifecycle state.
         match state {
             DialogState::Updated(_, _, _)
@@ -1775,24 +1784,9 @@ impl DialogInner {
             }
             _ => {}
         }
-        // Notify only transitions that are actually applied, and do it while
-        // holding the state lock so notifications follow the order in which
-        // the state changed.
-        let mut old_state = self.state.lock();
-        match (&*old_state, &state) {
-            (DialogState::Terminated(id, _), _) => {
-                warn!(
-                    id = %id,
-                    target = %state,
-                    "dialog already terminated, ignoring transition"
-                );
-                return Ok(());
-            }
-            (DialogState::Confirmed(_, _), DialogState::WaitAck(_, _)) => {
-                warn!(target = %state, "dialog already confirmed, ignoring transition");
-                return Ok(());
-            }
-            _ => {}
+        if let (DialogState::Confirmed(_, _), DialogState::WaitAck(_, _)) = (&*old_state, &state) {
+            warn!(target = %state, "dialog already confirmed, ignoring transition");
+            return Ok(());
         }
         debug!(from = %old_state, to = %state, "transitioning state");
         *old_state = state.clone();
@@ -1807,7 +1801,7 @@ impl DialogInner {
         mut rx: TransactionCommandReceiver,
     ) -> Result<()> {
         let timeout_duration = self.endpoint_inner.option.t1x64;
-        let result = tokio::time::timeout(timeout_duration, async {
+        let result = crate::platform::timeout(timeout_duration, async {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     TransactionCommand::Respond {
@@ -1847,8 +1841,8 @@ impl DialogInner {
     }
 }
 
-impl std::fmt::Display for DialogState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for DialogState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             DialogState::Calling(id) => write!(f, "{}(Calling)", id),
             DialogState::Trying(id) => write!(f, "{}(Trying)", id),

@@ -178,10 +178,12 @@ too.
 
 ## 10. One notification per applied dialog transition (rcx PR #771): in fork, diverges
 
-- **Fork:** `DialogInner::transition` (fork PR #4). A lifecycle transition
-  after `Terminated` is neither applied nor notified. Event-only states
-  (`Updated`, `Notify`, `Info`, `Options`, `Refer`) are not gated: they are
-  notified whatever the lifecycle state, as in the vendor.
+- **Fork:** `DialogInner::transition` (fork PR #4). Nothing after
+  `Terminated` is applied or notified, a second `Terminated` included.
+  Since the 0.7.0 sync this covers the event-only states too (`Updated`,
+  `Notify`, `Info`, `Options`, `Refer`), as upstream 0.7.0 does: their
+  handle is dropped, so the request is answered 501. While the dialog is
+  live, event-only states are notified as in the vendor.
 - **Diverges:**
   - The ignored `WaitAck`-after-`Confirmed` transition is no longer notified
     (the vendor notified it). rcx does not depend on that. `WaitAck` only
@@ -291,6 +293,20 @@ rcx depends on, so the 0.5.16 behavior was put back on this branch.
   `sent_ack`, the 2xx-after-CANCEL ACK + BYE, late-2xx ACK replay). Upstream's
   test compares the delivered response after clearing the fork's
   `received_from` stamp.
+- Upstream 0.7.0 (no_std + embassy backend, merged in the 0.7.0 sync):
+  - The endpoint and dialog maps (`transactions`, `finished_transactions`,
+    `waiting_ack`, `dialogs`) are `platform::sync::RwMap` (a `BTreeMap`
+    behind one lock) instead of `DashMap`. `get` returns a clone,
+    `remove` returns the value (no key), iteration goes through
+    `with(|map| ...)` / `with_mut`. The fork adds a DashMap-shaped
+    `remove_if` for its late-ACK routing.
+  - TCP/TLS/WS transports need the `platform-tokio` feature, which the
+    default features include. The UDP socket is `Arc<dyn UdpSocket>`.
+  - rsipstack no longer depends on `tracing-subscriber`, so it stops
+    turning on its `local-time` feature for the whole build. rcx's
+    `LocalTime` log timer needs `local-time` declared by rcx itself.
+  - std builds keep the OS RNG for tags, branches and Call-IDs; the
+    xorshift fallback is no_std only.
 - `Response` has two new public fields. Struct literals must set
   `synthetic: false, received_from: None` (rcx's tests already do).
 - `Dialog::ClientInvite` / `Dialog::ServerInvite` are now `Dialog::Invite(InviteDialog)`.

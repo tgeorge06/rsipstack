@@ -1,3 +1,4 @@
+use crate::prelude::*;
 use super::{
     key::TransactionKey,
     make_via_branch,
@@ -12,14 +13,10 @@ use crate::{
     Error, Result, VERSION,
 };
 use async_trait::async_trait;
-use dashmap::DashMap;
-use parking_lot::Mutex;
-use std::{sync::Arc, time::Duration};
-use tokio::{
-    select,
-    sync::mpsc::{error, unbounded_channel},
-};
-use tokio_util::sync::CancellationToken;
+use crate::platform::sync::RwMap;
+use crate::platform::sync::Mutex;
+use crate::platform::mpsc::{error, unbounded_channel};
+use crate::platform::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 pub trait MessageInspector: Send + Sync {
@@ -112,14 +109,14 @@ pub struct EndpointInner {
     pub user_agent: String,
     pub timers: Timer<TransactionTimer>,
     pub transport_layer: TransportLayer,
-    pub finished_transactions: DashMap<TransactionKey, Option<SipMessage>>,
-    pub transactions: DashMap<TransactionKey, TransactionEventSender>,
-    pub waiting_ack: DashMap<DialogId, TransactionKey>,
+    pub finished_transactions: RwMap<TransactionKey, Option<SipMessage>>,
+    pub transactions: RwMap<TransactionKey, TransactionEventSender>,
+    pub waiting_ack: RwMap<DialogId, TransactionKey>,
     /// Server INVITE transactions waiting for the ACK of their 2xx, by dialog
     /// and INVITE CSeq number. `waiting_ack` holds only the latest INVITE of a
     /// dialog; the ACK of an earlier re-INVITE can arrive after the next one
     /// (RFC 3261 §13.2.2.4: the ACK carries the CSeq number of its INVITE).
-    pub(crate) waiting_ack_cseq: DashMap<(DialogId, u32), TransactionKey>,
+    pub(crate) waiting_ack_cseq: RwMap<(DialogId, u32), TransactionKey>,
     incoming_sender: TransactionSender,
     incoming_receiver: Mutex<Option<TransactionReceiver>>,
     cancel_token: CancellationToken,
@@ -142,7 +139,7 @@ pub type EndpointInnerRef = Arc<EndpointInner>;
 ///
 /// ```rust
 /// use rsipstack::EndpointBuilder;
-/// use std::time::Duration;
+/// use core::time::Duration;
 ///
 /// let endpoint = EndpointBuilder::new()
 ///     .with_user_agent("MyApp/1.0")
@@ -236,10 +233,10 @@ impl EndpointInner {
             user_agent,
             timers: Timer::new(),
             transport_layer,
-            transactions: DashMap::new(),
-            finished_transactions: DashMap::new(),
-            waiting_ack: DashMap::new(),
-            waiting_ack_cseq: DashMap::new(),
+            transactions: RwMap::<TransactionKey, TransactionEventSender>::new(),
+            finished_transactions: RwMap::<TransactionKey, Option<SipMessage>>::new(),
+            waiting_ack: RwMap::<DialogId, TransactionKey>::new(),
+            waiting_ack_cseq: RwMap::<(DialogId, u32), TransactionKey>::new(),
             timer_interval: timer_interval.unwrap_or(Duration::from_millis(20)),
             cancel_token,
             incoming_sender,
@@ -252,12 +249,18 @@ impl EndpointInner {
     }
 
     pub async fn serve(self: &Arc<Self>) -> Result<()> {
-        select! {
-            _ = self.cancel_token.cancelled() => {},
-            _ = self.process_timer() => {},
-            r = self.clone().process_transport_layer() => {
+        use crate::platform::select::Which3;
+        let mut cancelled_f = core::pin::pin!(self.cancel_token.cancelled());
+        let mut timer_f = core::pin::pin!(self.process_timer());
+        let mut transport_f = core::pin::pin!(self.clone().process_transport_layer());
+        match crate::platform::select::select3(&mut cancelled_f, &mut timer_f, &mut transport_f)
+            .await
+        {
+            Which3::A(()) => {}
+            Which3::B(()) => {}
+            Which3::C(r) => {
                 r?;
-            },
+            }
         }
         Ok(())
     }
@@ -391,7 +394,7 @@ impl EndpointInner {
                 let last_message = self
                     .finished_transactions
                     .get(&key)
-                    .and_then(|v| v.value().clone());
+                    .and_then(|v| v.clone());
 
                 if let Some(last_message) = last_message {
                     // ACK for a completed ServerInvite transaction: absorb it silently
@@ -419,7 +422,7 @@ impl EndpointInner {
                 let last_message = self
                     .finished_transactions
                     .get(&key)
-                    .and_then(|v| v.value().clone())
+                    .and_then(|v| v.clone())
                     .filter(|_| {
                         // Never replay a cached ACK for a successful response
                         // that still has an upstream recipient.
@@ -623,7 +626,7 @@ impl EndpointInner {
     }
 
     pub fn get_running_transactions(&self) -> Option<Vec<TransactionKey>> {
-        Some(self.transactions.iter().map(|e| e.key().clone()).collect())
+        Some(self.transactions.with(|m| m.keys().cloned().collect()))
     }
 
     pub fn get_stats(&self) -> EndpointStats {

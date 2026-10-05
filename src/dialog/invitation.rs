@@ -1,3 +1,4 @@
+use crate::prelude::*;
 use super::{
     authenticate::Credential,
     dialog::{DialogInner, DialogStateSender},
@@ -24,7 +25,6 @@ use crate::{
     Result,
 };
 use futures::FutureExt;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// INVITE Request Options
@@ -171,10 +171,10 @@ impl DialogGuard {
 impl Drop for DialogGuard {
     fn drop(&mut self) {
         let dlg = match self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) {
-            Some((_, dlg)) => dlg,
+            Some(dlg) => dlg,
             None => return,
         };
-        let _handle = tokio::spawn(async move {
+        let _handle = crate::platform::spawn(async move {
             if let Err(e) = dlg.hangup().await {
                 info!(id = %dlg.id(), error = %e, "failed to hangup dialog");
             }
@@ -217,14 +217,14 @@ impl DialogGuardForUnconfirmed<'_> {
                     client_dialog.id(),
                     TerminatedReason::UacCancel,
                 ));
-                tokio::spawn(abandon_before_provisional(client_dialog, invite_tx));
+                crate::platform::spawn(abandon_before_provisional(client_dialog, invite_tx));
             }
             DialogState::Trying(_) | DialogState::Early(_, _) => {
                 debug!(id = %client_dialog.id(), "taken dialog dropped mid-INVITE, watching for a 2xx");
-                tokio::spawn(async move {
+                crate::platform::spawn(async move {
                     invite_tx.stop_retransmissions();
                     let deadline =
-                        tokio::time::Instant::now() + invite_tx.endpoint_inner.option.t1x64;
+                        crate::platform::Instant::now() + invite_tx.endpoint_inner.option.t1x64;
                     let final_response = wait_final_response(&mut invite_tx, deadline).await;
                     drop(invite_tx);
                     bye_if_2xx_after_cancel(&client_dialog, final_response).await;
@@ -237,7 +237,7 @@ impl DialogGuardForUnconfirmed<'_> {
 
 impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
     fn drop(&mut self) {
-        let Some((_, dlg)) = self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) else {
+        let Some(dlg) = self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) else {
             self.watch_taken_dialog();
             return;
         };
@@ -261,7 +261,8 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
                 let Some(invite_tx) = invite_tx else {
                     return;
                 };
-                let _handle = tokio::spawn(abandon_before_provisional(client_dialog, invite_tx));
+                let _handle =
+                    crate::platform::spawn(abandon_before_provisional(client_dialog, invite_tx));
             }
             DialogState::Terminated(_, _) => {}
             DialogState::Trying(_) | DialogState::Early(_, _) => {
@@ -274,47 +275,62 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
                 };
 
                 debug!(%self.id, "unconfirmed dialog dropped, cancelling it");
-                let _handle = tokio::spawn(async move {
+                let _handle = crate::platform::spawn(async move {
                     let deadline =
-                        tokio::time::Instant::now() + invite_tx.endpoint_inner.option.t1x64;
-                    let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(2));
-                    tokio::pin!(timeout);
+                        crate::platform::Instant::now() + invite_tx.endpoint_inner.option.t1x64;
+                    let mut timeout =
+                        core::pin::pin!(crate::platform::sleep(core::time::Duration::from_secs(2)));
                     invite_tx.stop_retransmissions();
 
                     let mut cancel_done = false;
                     let mut final_response = None;
-                    let cancel = client_dialog.cancel();
-                    tokio::pin!(cancel);
+                    // Boxed so it can be dropped before the wait below.
+                    let mut cancel = Box::pin(client_dialog.cancel());
 
+                    use crate::platform::select::Which3;
                     loop {
-                        tokio::select! {
-                            _ = &mut timeout => break,
-                            result = &mut cancel, if !cancel_done => {
-                                match result {
-                                    Ok(()) => cancel_done = true,
-                                    Err(e) => {
-                                        warn!(id = %client_dialog.id(), error = %e, "dialog cancel failed");
-                                        break;
-                                    }
+                        // after cancel completes, use pending as placeholder (3-arm race with
+// unchanged types)
+                        let cancel_sel = if cancel_done {
+                            futures::future::Either::Left(core::future::pending::<
+                                core::result::Result<(), crate::Error>,
+                            >())
+                        } else {
+                            futures::future::Either::Right(&mut cancel)
+                        };
+                        let mut cancel_sel = core::pin::pin!(cancel_sel);
+                        let mut recv_f = core::pin::pin!(invite_tx.receive());
+                        match crate::platform::select::select3(
+                            &mut timeout,
+                            &mut cancel_sel,
+                            &mut recv_f,
+                        )
+                        .await
+                        {
+                            Which3::A(()) => break,
+                            Which3::B(result) => match result {
+                                Ok(()) => cancel_done = true,
+                                Err(e) => {
+                                    warn!(id = %client_dialog.id(), error = %e, "dialog cancel failed");
+                                    break;
                                 }
-                            }
-                            msg = invite_tx.receive() => {
-                                match msg {
-                                    Some(SipMessage::Response(resp))
-                                        if resp.status_code.kind() != StatusCodeKind::Provisional =>
-                                    {
-                                        debug!(
-                                            id = %client_dialog.id(),
-                                            status = %resp.status_code,
-                                            "received final response"
-                                        );
-                                        final_response = Some(resp);
-                                        break;
-                                    }
-                                    Some(_) => {}
-                                    None => break,
+                            },
+                            Which3::C(msg) => match msg {
+                                Some(SipMessage::Response(resp))
+                                    if resp.status_code.kind()
+                                        != StatusCodeKind::Provisional =>
+                                {
+                                    debug!(
+                                        id = %client_dialog.id(),
+                                        status = %resp.status_code,
+                                        "received final response"
+                                    );
+                                    final_response = Some(resp);
+                                    break;
                                 }
-                            }
+                                Some(_) => {}
+                                None => break,
+                            },
                         }
                     }
 
@@ -337,7 +353,7 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
                 });
             }
             DialogState::Confirmed(_, _) => {
-                let _handle = tokio::spawn(async move {
+                let _handle = crate::platform::spawn(async move {
                     if let Err(e) = client_dialog.hangup().await {
                         info!(id = %client_dialog.id(), error = %e, "failed to hangup confirmed dialog");
                     }
@@ -355,25 +371,30 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
 async fn abandon_before_provisional(client_dialog: InviteDialog, mut invite_tx: Transaction) {
     invite_tx.stop_retransmissions();
     let t1x64 = invite_tx.endpoint_inner.option.t1x64;
-    let deadline = tokio::time::Instant::now() + t1x64;
+    let deadline = crate::platform::Instant::now() + t1x64;
     let final_response = match wait_response(&mut invite_tx, deadline).await {
         Some(resp) if resp.status_code.kind() == StatusCodeKind::Provisional => {
             // A fresh window for the CANCEL and the final response.
-            let deadline = tokio::time::Instant::now() + t1x64;
-            let cancel = client_dialog.send_cancel();
-            tokio::pin!(cancel);
+            let deadline = crate::platform::Instant::now() + t1x64;
+            let mut cancel = core::pin::pin!(client_dialog.send_cancel());
             let mut cancel_done = false;
-            let final_wait = wait_final_response(&mut invite_tx, deadline);
-            tokio::pin!(final_wait);
+            let mut final_wait = core::pin::pin!(wait_final_response(&mut invite_tx, deadline));
             loop {
-                tokio::select! {
-                    result = &mut cancel, if !cancel_done => {
+                // Once the CANCEL is done, race the final response alone.
+                let cancel_sel = if cancel_done {
+                    futures::future::Either::Left(core::future::pending())
+                } else {
+                    futures::future::Either::Right(&mut cancel)
+                };
+                let mut cancel_sel = core::pin::pin!(cancel_sel);
+                match crate::platform::select::select2(&mut cancel_sel, &mut final_wait).await {
+                    crate::platform::select::Either::A(result) => {
                         cancel_done = true;
                         if let Err(e) = result {
                             warn!(id = %client_dialog.id(), error = %e, "dialog cancel failed");
                         }
                     }
-                    resp = &mut final_wait => break resp,
+                    crate::platform::select::Either::B(resp) => break resp,
                 }
             }
         }
@@ -400,7 +421,7 @@ async fn bye_if_2xx_after_cancel(client_dialog: &InviteDialog, final_response: O
 /// Wait until `deadline` for the INVITE transaction's first response.
 async fn wait_response(
     invite_tx: &mut Transaction,
-    deadline: tokio::time::Instant,
+    deadline: crate::platform::Instant,
 ) -> Option<Response> {
     let wait = async {
         while let Some(msg) = invite_tx.receive().await {
@@ -410,13 +431,13 @@ async fn wait_response(
         }
         None
     };
-    tokio::time::timeout_at(deadline, wait).await.ok().flatten()
+    timeout_at(deadline, wait).await
 }
 
 /// Wait until `deadline` for the INVITE transaction's final response.
 async fn wait_final_response(
     invite_tx: &mut Transaction,
-    deadline: tokio::time::Instant,
+    deadline: crate::platform::Instant,
 ) -> Option<Response> {
     let wait = async {
         while let Some(msg) = invite_tx.receive().await {
@@ -428,7 +449,18 @@ async fn wait_final_response(
         }
         None
     };
-    tokio::time::timeout_at(deadline, wait).await.ok().flatten()
+    timeout_at(deadline, wait).await
+}
+
+/// Run `wait` until `deadline`; `None` once the deadline has passed.
+async fn timeout_at<T>(
+    deadline: crate::platform::Instant,
+    wait: impl core::future::Future<Output = Option<T>>,
+) -> Option<T> {
+    let limit = deadline
+        .checked_duration_since(crate::platform::Instant::now())
+        .unwrap_or_default();
+    crate::platform::timeout(limit, wait).await.ok().flatten()
 }
 
 pub type InviteAsyncResult = Result<(DialogId, Option<Response>)>;
@@ -815,7 +847,7 @@ impl DialogLayer {
         self: &Arc<Self>,
         opt: InviteOption,
         state_sender: DialogStateSender,
-    ) -> Result<(InviteDialog, tokio::task::JoinHandle<InviteAsyncResult>)> {
+    ) -> Result<(InviteDialog, crate::platform::JoinHandle<InviteAsyncResult>)> {
         let (dialog, mut tx) = self.create_client_invite_dialog(opt, state_sender)?;
         let id0 = dialog.id();
 
@@ -828,7 +860,7 @@ impl DialogLayer {
         let dialog_clone = dialog.clone();
 
         // 2) run invite in background, keep registry updated like do_invite()
-        let handle = tokio::spawn(async move {
+        let handle = crate::platform::spawn_with_result(async move {
             let r = dialog_clone.process_invite(&mut tx).boxed().await;
 
             // remove early key
