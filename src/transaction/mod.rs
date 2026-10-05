@@ -1,7 +1,8 @@
+use crate::prelude::*;
 use crate::transport::{SipAddr, SipConnection};
 use key::TransactionKey;
-use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use core::time::Duration;
+use crate::platform::mpsc::{UnboundedReceiver, UnboundedSender};
 pub use transaction::Transaction;
 pub mod endpoint;
 pub mod key;
@@ -106,8 +107,8 @@ pub enum TransactionState {
     Terminated,
 }
 
-impl std::fmt::Display for TransactionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for TransactionState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TransactionState::Nothing => write!(f, "Nothing"),
             TransactionState::Calling => write!(f, "Calling"),
@@ -176,8 +177,8 @@ pub enum TransactionType {
     ServerInvite,
     ServerNonInvite,
 }
-impl std::fmt::Display for TransactionType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for TransactionType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TransactionType::ClientInvite => write!(f, "ClientInvite"),
             TransactionType::ClientNonInvite => write!(f, "ClientNonInvite"),
@@ -222,7 +223,7 @@ impl std::fmt::Display for TransactionType {
 ///
 /// ```rust
 /// use rsipstack::transaction::{TransactionTimer, key::{TransactionKey, TransactionRole}};
-/// use std::time::Duration;
+/// use core::time::Duration;
 ///
 /// # fn example() -> rsipstack::Result<()> {
 /// // Create a mock request to generate a transaction key
@@ -285,8 +286,8 @@ impl TransactionTimer {
     }
 }
 
-impl std::fmt::Display for TransactionTimer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for TransactionTimer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TransactionTimer::TimerA(key, duration) => {
                 write!(f, "TimerA: {} {}", key, duration.as_millis())
@@ -337,10 +338,32 @@ pub fn make_uuid_v4() -> String {
     )
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "std", not(target_family = "wasm")))]
 fn fill_random_bytes(buf: &mut [u8]) {
     use rand::Rng;
     rand::rng().fill_bytes(buf);
+}
+
+/// no_std fallback: xorshift64* over a process-lifetime counter. Uniqueness
+/// is what tags/branches need; hardware entropy arrives with the embassy
+/// backend (WP3) — do not rely on this for secrets.
+#[cfg(not(feature = "std"))]
+fn fill_random_bytes(buf: &mut [u8]) {
+    use crate::platform::atomic64::AtomicU64;
+    use core::sync::atomic::Ordering;
+    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let mut i = 0;
+    while i < buf.len() {
+        let mut x = STATE.load(Ordering::Relaxed);
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        STATE.store(x, Ordering::Relaxed);
+        let out = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let take = (buf.len() - i).min(8);
+        buf[i..i + take].copy_from_slice(&out.to_le_bytes()[..take]);
+        i += take;
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -354,7 +377,7 @@ pub fn make_tag() -> crate::sip::param::Tag {
     random_text(TO_TAG_LEN).into()
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "std", not(target_family = "wasm")))]
 pub fn random_text(count: usize) -> String {
     use rand::RngExt;
     rand::rng()
@@ -362,6 +385,18 @@ pub fn random_text(count: usize) -> String {
         .take(count)
         .map(char::from)
         .collect::<String>()
+}
+
+#[cfg(not(feature = "std"))]
+pub fn random_text(count: usize) -> String {
+    const ALNUM: &[u8; 62] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut bytes = vec![0u8; count];
+    fill_random_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|b| ALNUM[(b % 62) as usize] as char)
+        .collect()
 }
 
 #[cfg(target_family = "wasm")]
