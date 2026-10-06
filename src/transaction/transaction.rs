@@ -1069,6 +1069,11 @@ impl Transaction {
                     debug!(key=%self.key, last = self.last_response.is_none(), "entered confirmed state, waiting for ACK");
                     if let Some(ref resp) = self.last_response {
                         let dialog_id = DialogId::try_from((resp, TransactionRole::Server))?;
+                        if let Ok(seq) = self.original.cseq_header().and_then(|c| c.seq()) {
+                            self.endpoint_inner
+                                .waiting_ack_cseq
+                                .insert((dialog_id.clone(), seq), self.key.clone());
+                        }
                         self.endpoint_inner
                             .waiting_ack
                             .insert(dialog_id, self.key.clone());
@@ -1090,7 +1095,11 @@ impl Transaction {
                 if self.transaction_type == TransactionType::ServerInvite {
                     if let Some(ref resp) = self.last_response {
                         if let Ok(dialog_id) = DialogId::try_from((resp, self.role())) {
-                            self.endpoint_inner.waiting_ack.remove(&dialog_id);
+                            self.endpoint_inner.forget_waiting_ack(
+                                dialog_id,
+                                &self.original,
+                                &self.key,
+                            );
                         }
                     }
                 }
@@ -1161,17 +1170,14 @@ impl Transaction {
             matches!(self.transaction_type, TransactionType::ServerInvite)
                 && self.state == TransactionState::Completed;
         if !is_server_invite_waiting_ack {
-            match self.last_response {
-                Some(ref resp) => match DialogId::try_from((resp, self.role())) {
-                    Ok(dialog_id) => self
-                        .endpoint_inner
-                        .waiting_ack
-                        .remove(&dialog_id)
-                        .map(|_| ()),
-                    Err(_) => None,
-                },
-                _ => None,
-            };
+            if let Some(Ok(dialog_id)) = self
+                .last_response
+                .as_ref()
+                .map(|resp| DialogId::try_from((resp, self.role())))
+            {
+                self.endpoint_inner
+                    .forget_waiting_ack(dialog_id, &self.original, &self.key);
+            }
         }
 
         let last_message = {
