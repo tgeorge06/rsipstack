@@ -1,8 +1,8 @@
-use crate::prelude::*;
 use super::{
     authenticate::{handle_client_authenticate, Credential},
     DialogId,
 };
+use crate::prelude::*;
 use crate::sip::prelude::HeadersExt;
 use crate::sip::{Header, Param, Response, SipMessage, StatusCode};
 use crate::{
@@ -54,6 +54,7 @@ use tracing::debug;
 ///     username: "alice".to_string(),
 ///     password: "secret123".to_string(),
 ///     realm: Some("example.com".to_string()),
+///     auth_username: None,
 /// };
 ///
 /// let mut registration = Registration::new(endpoint.inner.clone(), Some(credential));
@@ -162,6 +163,7 @@ impl Registration {
     ///     username: "alice".to_string(),
     ///     password: "secret123".to_string(),
     ///     realm: Some("example.com".to_string()),
+    ///     auth_username: None,
     /// };
     /// let registration = Registration::new(endpoint.inner.clone(), Some(credential));
     /// # }

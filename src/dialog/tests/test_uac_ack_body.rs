@@ -137,6 +137,7 @@ async fn assert_armed_body_survives_challenge(code: u16) -> crate::Result<()> {
         username: "alice".to_string(),
         password: "secret".to_string(),
         realm: None,
+        auth_username: None,
     };
     let (dialog, _states, peer) = establish_with_credential(&token, Some(credential)).await?;
 

@@ -1,4 +1,3 @@
-use crate::prelude::*;
 use super::{
     authenticate::{handle_client_authenticate, Credential},
     invite_dialog::InviteDialog,
@@ -6,6 +5,10 @@ use super::{
     subscription::{ClientSubscriptionDialog, ServerSubscriptionDialog},
     DialogId,
 };
+use crate::platform::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use crate::platform::sync::Mutex;
+use crate::platform::CancellationToken;
+use crate::prelude::*;
 use crate::sip::{
     headers::typed::record_route::split_rr_values,
     prelude::{HeadersExt, ToTypedHeader},
@@ -22,11 +25,8 @@ use crate::{
     transport::{SipAddr, SipConnection},
     Result,
 };
-use futures::FutureExt;
-use crate::platform::sync::Mutex;
 use core::sync::atomic::{AtomicU32, Ordering};
-use crate::platform::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use crate::platform::CancellationToken;
+use futures::FutureExt;
 use tracing::{debug, info, warn};
 
 pub type TransactionCommandSender = crate::platform::BoundedSender<TransactionCommand>;
@@ -125,51 +125,6 @@ pub enum DialogState {
     Info(DialogId, crate::sip::Request, TransactionHandle),
     Options(DialogId, crate::sip::Request, TransactionHandle),
     Terminated(DialogId, TerminatedReason),
-}
-
-/// How the re-INVITE transaction on an established dialog ended. Read with
-/// [`InviteDialog::take_reinvite_ack`](crate::dialog::invite_dialog::InviteDialog::take_reinvite_ack):
-///
-/// * [`ReinviteAck::Received`]: the ACK correlated to the re-INVITE by CSeq,
-///   with the body a UAC puts there when the 2xx carried the offer (RFC 3261
-///   §14.2). Stored before the `Confirmed` state notified for it; read it on
-///   that `Confirmed`.
-/// * [`ReinviteAck::TimedOut`]: no ACK within 64*T1 after a 2xx. The session
-///   is ended (RFC 3261 §13.3.1.4); stored before `Terminated(Timeout)` is
-///   notified, read it on that `Terminated`. No `Confirmed` is notified for
-///   it. It is final: an outcome of another re-INVITE transaction still
-///   outstanding never replaces it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReinviteAck {
-    Received { cseq: u32, body: Option<Vec<u8>> },
-    TimedOut { cseq: u32 },
-}
-
-/// The last [`ReinviteAck`] of a dialog, with the rule that a `TimedOut`
-/// (which ends the session) is final.
-#[derive(Debug, Default)]
-pub(super) struct ReinviteAckSlot {
-    outcome: Option<ReinviteAck>,
-    /// A `TimedOut` was stored: later outcomes are ignored.
-    frozen: bool,
-}
-
-impl ReinviteAckSlot {
-    pub(super) fn store(&mut self, outcome: ReinviteAck) {
-        if self.frozen {
-            debug!(
-                ?outcome,
-                "re-invite outcome ignored: the session already timed out"
-            );
-            return;
-        }
-        self.frozen = matches!(outcome, ReinviteAck::TimedOut { .. });
-        self.outcome = Some(outcome);
-    }
-
-    pub(super) fn take(&mut self) -> Option<ReinviteAck> {
-        self.outcome.take()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -378,9 +333,6 @@ pub struct DialogInner {
     /// The last ACK received for an INVITE or re-INVITE this dialog answered
     /// (UAS role). Carries the answer when the 2xx carried the offer.
     pub(super) remote_ack: Mutex<Option<Request>>,
-    /// The outcome of the last re-INVITE transaction this dialog answered,
-    /// see [`ReinviteAck`]. Taken by `InviteDialog::take_reinvite_ack`.
-    pub(super) reinvite_ack: Mutex<ReinviteAckSlot>,
     /// UAC side: the body the NEXT in-dialog INVITE's 2xx ACK carries (the
     /// answer to an offer in that 2xx, RFC 3261 §14.2), consumed by that one
     /// request. Armed with `InviteDialog::set_next_ack_body`.
@@ -553,7 +505,6 @@ impl DialogInner {
             supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
-            reinvite_ack: Mutex::new(ReinviteAckSlot::default()),
             next_ack_body: Mutex::new(None),
             last_sent_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
@@ -832,12 +783,6 @@ impl DialogInner {
         *self.remote_contact.lock() = contact;
     }
 
-    /// Update the stored route set from Record-Route headers present in a response.
-    ///
-    /// Client dialogs learn their route set from the 2xx response that establishes
-    /// the dialog (RFC 3261 §12.1.2). Persisting it here ensures all subsequent
-    /// in-dialog requests reuse the same proxy chain instead of targeting the
-    /// remote contact directly.
     /// Take the route set, Contact and remote target from a 2xx to the
     /// INVITE (RFC 3261 §12.1.2).
     ///
@@ -875,6 +820,12 @@ impl DialogInner {
         Ok(())
     }
 
+    /// Update the stored route set from Record-Route headers present in a response.
+    ///
+    /// Client dialogs learn their route set from the 2xx response that establishes
+    /// the dialog (RFC 3261 §12.1.2). Persisting it here ensures all subsequent
+    /// in-dialog requests reuse the same proxy chain instead of targeting the
+    /// remote contact directly.
     pub(crate) fn update_route_set_from_response(&self, resp: &Response) {
         if !matches!(self.role, TransactionRole::Client) {
             return;
@@ -1454,79 +1405,10 @@ impl DialogInner {
         }
     }
 
-    /// Wait for the ACK of a re-INVITE this dialog answered, until the
-    /// server transaction ends. Same for a UAS and a UAC dialog.
-    ///
-    /// The ACK is accepted only when its CSeq equals the re-INVITE's (an ACK
-    /// of another transaction is ignored and the wait continues). It is
-    /// stored as [`ReinviteAck::Received`] (and as the last remote ACK)
-    /// before the `Confirmed` state is notified.
-    ///
-    /// RFC 3261 §13.3.1.4 (which §14.2 applies to re-INVITEs): a 2xx that
-    /// gets no ACK within 64*T1 ends the session. [`ReinviteAck::TimedOut`]
-    /// is stored, so a consumer can tell why, and the dialog is ended as for
-    /// an initial INVITE ([`Self::end_session_without_ack`]):
-    /// `Terminated(Timeout)` and a BYE. No `Confirmed` is notified for the
-    /// timed-out re-INVITE: the offer/answer it started never completed, and
-    /// consumers read `Confirmed` after a re-INVITE as a finished
-    /// renegotiation.
-    pub(super) async fn await_reinvite_ack(&self, tx: &mut Transaction) -> Result<()> {
-        let reinvite_cseq = tx
-            .original
-            .cseq_header()
-            .and_then(|c| c.seq())
-            .unwrap_or_default();
-        // The final response, read before the wait: a server INVITE
-        // transaction gives up `last_response` when it terminates.
-        let final_response = tx.last_response.clone();
-        while let Some(msg) = tx.receive().await {
-            let SipMessage::Request(req) = msg else {
-                continue;
-            };
-            if req.method != Method::Ack {
-                continue;
-            }
-            let ack_cseq = req.cseq_header().and_then(|c| c.seq()).unwrap_or_default();
-            if ack_cseq != reinvite_cseq {
-                debug!(
-                    id = %self.id.lock(),
-                    ack_cseq,
-                    reinvite_cseq,
-                    "ignoring ACK that does not belong to this re-invite"
-                );
-                continue;
-            }
-            debug!(id = %self.id.lock(), "received ack for re-invite {}", req.uri);
-            self.reinvite_ack.lock().store(ReinviteAck::Received {
-                cseq: ack_cseq,
-                body: (!req.body.is_empty()).then(|| req.body.clone()),
-            });
-            self.remote_ack.lock().replace(req);
-            let id = self.id.lock().clone();
-            return self.transition(DialogState::Confirmed(
-                id,
-                final_response.unwrap_or_default(),
-            ));
-        }
-        let answered_2xx = final_response
-            .as_ref()
-            .is_some_and(|resp| resp.status_code.kind() == StatusCodeKind::Successful);
-        if answered_2xx {
-            let id = self.id.lock().clone();
-            warn!(%id, reinvite_cseq, "re-invite 2xx was never acknowledged");
-            self.reinvite_ack.lock().store(ReinviteAck::TimedOut {
-                cseq: reinvite_cseq,
-            });
-        }
-        self.end_session_without_ack(tx, answered_2xx).await;
-        Ok(())
-    }
-
     /// RFC 3261 §13.3.1.4: the server transaction of an INVITE or re-INVITE
     /// retransmitted our 2xx (`answered_2xx`) for 64*T1 and ended without an
     /// ACK. The dialog is terminated with [`TerminatedReason::Timeout`] and the
-    /// session is ended with a BYE (sent after `Terminated` is notified, so
-    /// the notification does not wait for the BYE's response).
+    /// session is ended with a BYE.
     pub(super) async fn end_session_without_ack(&self, tx: &Transaction, answered_2xx: bool) {
         if !answered_2xx
             || tx.state != crate::transaction::TransactionState::Terminated
@@ -1680,7 +1562,6 @@ impl DialogInner {
             supports_100rel: snapshot.supports_100rel,
             remote_reliable: Mutex::new(None),
             remote_ack: Mutex::new(None),
-            reinvite_ack: Mutex::new(ReinviteAckSlot::default()),
             next_ack_body: Mutex::new(None),
             last_sent_ack: Mutex::new(None),
             server_connection: Mutex::new(None),
@@ -1795,6 +1676,8 @@ impl DialogInner {
         Ok(())
     }
 
+    #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
     pub async fn process_transaction_handle(
         &self,
         tx: &mut Transaction,

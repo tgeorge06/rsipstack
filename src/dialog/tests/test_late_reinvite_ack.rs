@@ -2,7 +2,8 @@
 //! and stops that 2xx's retransmissions (RFC 3261 §13.2.2.4, §13.3.1.4).
 //! Over UDP the ACK of one re-INVITE can arrive after the next re-INVITE on
 //! the same dialog: it must still reach its own transaction, and must not be
-//! taken for the ACK of the newer one.
+//! taken for the ACK of the newer one. Each `Confirmed` carries the 2xx its
+//! ACK confirms, although that ACK ends the server transaction.
 use crate::dialog::{
     dialog::{Dialog, DialogState, DialogStateReceiver},
     dialog_layer::DialogLayer,
@@ -201,7 +202,15 @@ async fn test_late_ack_of_previous_reinvite_reaches_its_own_transaction() -> cra
         .to_string();
     peer.send_request(Method::Ack, 1, "z9hG4bK-ack-1", Some(&to_tag))
         .await;
-    while !matches!(next_state(&mut states).await, DialogState::Confirmed(..)) {}
+    // The matching ACK ends the Accepted server transaction (RFC 6026 §7.1);
+    // `Confirmed` still carries the 2xx it confirms.
+    let confirmed = loop {
+        if let DialogState::Confirmed(_, resp) = next_state(&mut states).await {
+            break resp;
+        }
+    };
+    assert_eq!(confirmed.status_code, StatusCode::OK);
+    assert_eq!(confirmed.cseq_header()?.seq()?, 1);
 
     // re-INVITE CSeq 2 is answered; its ACK is delayed in the network.
     peer.send_request(Method::Invite, 2, "z9hG4bK-invite-2", Some(&to_tag))

@@ -1,6 +1,7 @@
-use crate::prelude::*;
 use super::dialog::DialogInnerRef;
 use super::DialogId;
+use crate::platform::CancellationToken;
+use crate::prelude::*;
 use crate::sip::prelude::HeadersExt;
 use crate::sip::{Response, SipMessage, StatusCode};
 use crate::transaction::transaction::Transaction;
@@ -14,7 +15,6 @@ use crate::{
     transaction::key::TransactionRole,
 };
 use core::sync::atomic::Ordering;
-use crate::platform::CancellationToken;
 use tracing::{debug, trace, warn};
 
 /// Client-side INVITE Dialog (UAC)
@@ -675,8 +675,19 @@ impl ClientInviteDialog {
             .transition(DialogState::Updated(self.id(), tx.original.clone(), handle))?;
 
         self.inner.process_transaction_handle(tx, rx).await?;
-        // Same ACK wait and RFC 3261 §13.3.1.4 timeout as `InviteDialog`.
-        self.inner.await_reinvite_ack(tx).await
+
+        // wait for ACK
+        while let Some(msg) = tx.receive().await {
+            match msg {
+                SipMessage::Request(req) if req.method == crate::sip::Method::Ack => {
+                    debug!(id = %self.id(), "received ACK for re-INVITE");
+                    self.inner.remote_ack.lock().replace(req);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     async fn handle_refer(&mut self, tx: &mut Transaction) -> Result<()> {

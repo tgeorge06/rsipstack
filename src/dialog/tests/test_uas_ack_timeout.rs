@@ -1,9 +1,8 @@
 //! RFC 3261 §13.3.1.4: a UAS retransmits its 2xx to an INVITE (T1, doubling)
 //! until the ACK arrives. If no ACK arrives within 64*T1, the session SHOULD
-//! be ended with a BYE. The dialog must not stay in `WaitAck` forever. The
-//! same holds for a re-INVITE (§14.2), on a UAS and on a UAC dialog.
+//! be ended with a BYE. The dialog must not stay in `WaitAck` forever.
 use crate::dialog::{
-    dialog::{Dialog, DialogState, DialogStateReceiver, ReinviteAck, TerminatedReason},
+    dialog::{Dialog, DialogState, DialogStateReceiver, TerminatedReason},
     dialog_layer::DialogLayer,
     invite_dialog::InviteDialog,
 };
@@ -181,6 +180,39 @@ fn is_invite_2xx(msg: &SipMessage) -> bool {
 fn is_2xx_to(msg: &SipMessage, cseq: u32) -> bool {
     is_invite_2xx(msg)
         && matches!(msg, SipMessage::Response(resp) if resp.cseq_header().unwrap().seq().unwrap() == cseq)
+}
+
+/// The BYE among `messages`: its arrival time, after checking it belongs to
+/// this dialog (Call-ID and both tags).
+fn bye_of_dialog(messages: &[(Instant, SipMessage)], local_tag: &str) -> Instant {
+    let (at, bye) = messages
+        .iter()
+        .find_map(|(at, m)| match m {
+            SipMessage::Request(req) if req.method == Method::Bye => Some((*at, req)),
+            _ => None,
+        })
+        .expect("the UAS must send a BYE when the ACK never arrives");
+    assert_eq!(bye.call_id_header().unwrap().value(), CALL_ID);
+    assert_eq!(
+        bye.from_header().unwrap().tag().unwrap().unwrap().value(),
+        local_tag,
+        "the BYE must come from the dialog's local tag"
+    );
+    assert_eq!(
+        bye.to_header().unwrap().tag().unwrap().unwrap().value(),
+        FROM_TAG
+    );
+    at
+}
+
+fn terminated_reason(states: &mut DialogStateReceiver) -> Option<TerminatedReason> {
+    let mut terminated = None;
+    while let Ok(state) = states.try_recv() {
+        if let DialogState::Terminated(_, reason) = state {
+            terminated = Some(reason);
+        }
+    }
+    terminated
 }
 
 #[tokio::test]
@@ -400,14 +432,13 @@ async fn test_2xx_retransmission_interval_doubles_up_to_t2() -> crate::Result<()
     Ok(())
 }
 
-/// Establish a call with the raw UAC peer (INVITE CSeq 1, 200, ACK) and
-/// answer its re-INVITE CSeq 2 with a 200. Returns the dialog, the To tag and
-/// when the re-INVITE was answered.
-async fn answer_reinvite(
-    states: &mut DialogStateReceiver,
-    dialogs: &mut UnboundedReceiver<InviteDialog>,
-    peer: &Peer,
-) -> crate::Result<(InviteDialog, String, Instant)> {
+/// The same applies to a re-INVITE: an established call whose re-INVITE 2xx
+/// is never ACKed is ended with a BYE (RFC 3261 §14.2 defers to §13.3.1.4).
+#[tokio::test]
+async fn test_unacked_reinvite_2xx_ends_the_session() -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let (mut states, mut dialogs, peer) = setup(&token, short_timers()).await?;
+
     peer.send_request(Method::Invite, 1, None).await;
     let dialog = tokio::time::timeout(Duration::from_secs(2), dialogs.recv())
         .await
@@ -431,8 +462,18 @@ async fn answer_reinvite(
         })
         .expect("the 2xx");
     peer.send_request(Method::Ack, 1, Some(&local_tag)).await;
-    wait_confirmed(states).await;
+    loop {
+        let state = tokio::time::timeout(Duration::from_secs(2), states.recv())
+            .await
+            .expect("timeout waiting for the call to be confirmed")
+            .expect("state channel closed");
+        if matches!(state, DialogState::Confirmed(..)) {
+            break;
+        }
+    }
 
+    // The call is up; the peer sends a re-INVITE and the application
+    // answers it.
     peer.send_request(Method::Invite, 2, Some(&local_tag)).await;
     let handle = loop {
         let state = tokio::time::timeout(Duration::from_secs(2), states.recv())
@@ -445,7 +486,32 @@ async fn answer_reinvite(
     };
     let answered = Instant::now();
     handle.reply(crate::sip::StatusCode::OK).await.ok();
-    Ok((dialog, local_tag, answered))
+
+    // The peer never ACKs the re-INVITE's 2xx.
+    let messages = peer.collect(answered + T1X64 * 2).await;
+    let oks: Vec<Instant> = messages
+        .iter()
+        .filter(|(_, m)| is_2xx_to(m, 2))
+        .map(|(at, _)| *at)
+        .collect();
+    assert!(
+        oks.len() >= 6 && *oks.last().unwrap() - answered >= T1X64 / 2,
+        "the re-INVITE 2xx must be retransmitted until 64*T1, got {} transmissions",
+        oks.len()
+    );
+    assert!(
+        matches!(
+            terminated_reason(&mut states),
+            Some(TerminatedReason::Timeout)
+        ),
+        "a re-INVITE 2xx without ACK must terminate the dialog with Timeout, state {}",
+        dialog.state()
+    );
+    let bye_at = bye_of_dialog(&messages, &local_tag);
+    assert!(bye_at - answered >= T1X64 - T1);
+
+    token.cancel();
+    Ok(())
 }
 
 async fn wait_confirmed(states: &mut DialogStateReceiver) {
@@ -458,284 +524,6 @@ async fn wait_confirmed(states: &mut DialogStateReceiver) {
             return;
         }
     }
-}
-
-fn drain(states: &mut DialogStateReceiver) -> Vec<DialogState> {
-    let mut seen = Vec::new();
-    while let Ok(state) = states.try_recv() {
-        seen.push(state);
-    }
-    seen
-}
-
-/// The re-INVITE teardown: its 2xx was retransmitted until 64*T1, then the
-/// session ended with a BYE of this dialog and `Terminated(Timeout)`;
-/// `ReinviteAck::TimedOut` tells why, and no `Confirmed` (a finished
-/// renegotiation) was notified for the re-INVITE.
-fn assert_reinvite_teardown(
-    messages: &[(Instant, SipMessage)],
-    seen: &[DialogState],
-    answered: Instant,
-    reinvite_cseq: u32,
-    is_bye_of_dialog: impl Fn(&crate::sip::Request) -> bool,
-) {
-    let oks: Vec<Instant> = messages
-        .iter()
-        .filter(|(_, m)| is_2xx_to(m, reinvite_cseq))
-        .map(|(at, _)| *at)
-        .collect();
-    assert!(
-        oks.len() >= 2 && *oks.last().unwrap() - answered >= T1X64 / 2,
-        "the re-INVITE 2xx must be retransmitted until 64*T1, got {} transmissions",
-        oks.len()
-    );
-    let (bye_at, bye) = messages
-        .iter()
-        .find_map(|(at, m)| match m {
-            SipMessage::Request(req) if req.method == Method::Bye => Some((*at, req)),
-            _ => None,
-        })
-        .expect("a re-INVITE 2xx without ACK must end the session with a BYE");
-    assert!(
-        is_bye_of_dialog(bye),
-        "the BYE must belong to the dialog: {bye}"
-    );
-    assert!(
-        bye_at - answered >= T1X64 - T1,
-        "the BYE must not be sent before 64*T1, sent after {:?}",
-        bye_at - answered
-    );
-    assert!(
-        matches!(
-            seen.iter().rev().find_map(|s| match s {
-                DialogState::Terminated(_, r) => Some(r),
-                _ => None,
-            }),
-            Some(TerminatedReason::Timeout)
-        ),
-        "the dialog must terminate with Timeout, got {seen:?}"
-    );
-    assert!(
-        !seen.iter().any(|s| matches!(
-            s,
-            DialogState::Confirmed(_, resp)
-                if resp.cseq_header().unwrap().seq().unwrap() == reinvite_cseq
-        )),
-        "a timed-out re-INVITE must not be reported as Confirmed, got {seen:?}"
-    );
-}
-
-/// RFC 3261 §13.3.1.4 applies to a re-INVITE too (§14.2): our UAS dialog
-/// answers the caller's re-INVITE, the 2xx is never ACKed, and the session is
-/// ended with a BYE and `Terminated(Timeout)`.
-#[tokio::test]
-async fn test_unacked_reinvite_2xx_ends_the_session() -> crate::Result<()> {
-    let token = CancellationToken::new();
-    let (mut states, mut dialogs, peer) = setup(&token, short_timers()).await?;
-    let (dialog, local_tag, answered) = answer_reinvite(&mut states, &mut dialogs, &peer).await?;
-
-    // The peer never ACKs the re-INVITE's 2xx.
-    let messages = peer.collect(answered + T1X64 * 2).await;
-    let seen = drain(&mut states);
-    assert_reinvite_teardown(&messages, &seen, answered, 2, |bye| {
-        bye.from_header().unwrap().tag().unwrap().unwrap().value() == local_tag
-            && bye.to_header().unwrap().tag().unwrap().unwrap().value() == FROM_TAG
-    });
-    assert_eq!(
-        dialog.take_reinvite_ack(),
-        Some(ReinviteAck::TimedOut { cseq: 2 })
-    );
-    assert!(dialog.state().is_terminated());
-    token.cancel();
-    Ok(())
-}
-
-/// An ACK that does not carry the re-INVITE's CSeq (here, a stale copy of the
-/// initial INVITE's) acknowledges nothing: the timeout still ends the session.
-#[tokio::test]
-async fn test_mismatched_ack_does_not_stop_the_reinvite_teardown() -> crate::Result<()> {
-    let token = CancellationToken::new();
-    let (mut states, mut dialogs, peer) = setup(&token, short_timers()).await?;
-    let (dialog, local_tag, answered) = answer_reinvite(&mut states, &mut dialogs, &peer).await?;
-
-    peer.collect(Instant::now() + T1 * 2).await;
-    peer.send_request(Method::Ack, 1, Some(&local_tag)).await;
-    let messages = peer.collect(answered + T1X64 * 2).await;
-    let seen = drain(&mut states);
-    assert_reinvite_teardown(&messages, &seen, answered, 2, |bye| {
-        bye.from_header().unwrap().tag().unwrap().unwrap().value() == local_tag
-    });
-    assert_eq!(
-        dialog.take_reinvite_ack(),
-        Some(ReinviteAck::TimedOut { cseq: 2 })
-    );
-    token.cancel();
-    Ok(())
-}
-
-/// A re-INVITE ACKed in time keeps the call up: `Received` then `Confirmed`,
-/// retransmissions stop, no BYE, no termination.
-#[tokio::test]
-async fn test_acked_reinvite_keeps_the_call_up() -> crate::Result<()> {
-    let token = CancellationToken::new();
-    let (mut states, mut dialogs, peer) = setup(&token, short_timers()).await?;
-    let (dialog, local_tag, answered) = answer_reinvite(&mut states, &mut dialogs, &peer).await?;
-
-    peer.collect(answered + T1 * 2).await;
-    peer.send_request(Method::Ack, 2, Some(&local_tag)).await;
-    let messages = peer.collect(answered + T1X64 * 2).await;
-    assert!(
-        !messages.iter().any(|(_, m)| matches!(
-            m,
-            SipMessage::Request(req) if req.method == Method::Bye
-        )),
-        "an ACKed re-INVITE must not end the session"
-    );
-    let seen = drain(&mut states);
-    assert!(
-        !seen
-            .iter()
-            .any(|s| matches!(s, DialogState::Terminated(..))),
-        "got {seen:?}"
-    );
-    assert!(seen.iter().any(|s| matches!(
-        s,
-        DialogState::Confirmed(_, resp) if resp.cseq_header().unwrap().seq().unwrap() == 2
-    )));
-    assert_eq!(
-        dialog.take_reinvite_ack(),
-        Some(ReinviteAck::Received {
-            cseq: 2,
-            body: None
-        })
-    );
-    assert!(dialog.state().is_confirmed());
-    token.cancel();
-    Ok(())
-}
-
-/// The same on our UAC dialog: the callee re-INVITEs us, never ACKs our 2xx,
-/// and the session is ended with a BYE and `Terminated(Timeout)`.
-#[tokio::test]
-async fn test_unacked_reinvite_2xx_ends_the_session_on_a_uac_dialog() -> crate::Result<()> {
-    use crate::dialog::invitation::InviteOption;
-    let token = CancellationToken::new();
-    let transport_layer = TransportLayer::new(token.child_token());
-    let udp = UdpConnection::create_connection(
-        "127.0.0.1:0".parse().unwrap(),
-        None,
-        Some(token.child_token()),
-    )
-    .await?;
-    let uac: SocketAddr = udp.get_addr().get_socketaddr()?;
-    transport_layer.add_transport(udp.into());
-    let endpoint = EndpointBuilder::new()
-        .with_user_agent("rsipstack-test")
-        .with_transport_layer(transport_layer)
-        .with_cancel_token(token.child_token())
-        .with_option(short_timers())
-        .build();
-    let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
-    let mut incoming = endpoint.incoming_transactions()?;
-    let endpoint_inner = endpoint.inner.clone();
-    tokio::spawn(async move {
-        let _ = endpoint_inner.serve().await;
-    });
-    let layer = dialog_layer.clone();
-    tokio::spawn(async move {
-        while let Some(mut tx) = incoming.recv().await {
-            if let Some(mut dialog) = layer.match_dialog(&tx) {
-                tokio::spawn(async move {
-                    let _ = dialog.handle(&mut tx).await;
-                });
-            }
-        }
-    });
-
-    // The callee: a raw UAS peer.
-    let callee = UdpSocket::bind("127.0.0.1:0").await?;
-    let callee_addr = callee.local_addr()?;
-    let (state_sender, mut states) = unbounded_channel();
-    let option = InviteOption {
-        caller: crate::sip::Uri::try_from("sip:alice@example.com")?,
-        callee: crate::sip::Uri::try_from(format!("sip:bob@{callee_addr}").as_str())?,
-        contact: crate::sip::Uri::try_from(format!("sip:alice@{uac}").as_str())?,
-        ..Default::default()
-    };
-    let layer = dialog_layer.clone();
-    let invite = tokio::spawn(async move { layer.do_invite(option, state_sender).await });
-
-    let mut buf = vec![0u8; 4096];
-    let (len, _) = tokio::time::timeout(Duration::from_secs(2), callee.recv_from(&mut buf))
-        .await
-        .expect("the INVITE")?;
-    let SipMessage::Request(inv) = SipMessage::try_from(std::str::from_utf8(&buf[..len]).unwrap())?
-    else {
-        panic!("expected the INVITE");
-    };
-    const CALLEE_TAG: &str = "callee-tag";
-    let ok = format!(
-        "SIP/2.0 200 OK\r\n\
-         Via: {}\r\nFrom: {}\r\nTo: {};tag={CALLEE_TAG}\r\nCall-ID: {}\r\nCSeq: {}\r\n\
-         Contact: <sip:bob@{callee_addr}>\r\nContent-Length: 0\r\n\r\n",
-        inv.via_header()?.value(),
-        inv.from_header()?.value(),
-        inv.to_header()?.value(),
-        inv.call_id_header()?.value(),
-        inv.cseq_header()?.value(),
-    );
-    callee.send_to(ok.as_bytes(), uac).await?;
-    let (dialog, _) = tokio::time::timeout(Duration::from_secs(2), invite)
-        .await
-        .expect("do_invite")
-        .expect("do_invite task")?;
-    assert!(dialog.state().is_confirmed());
-    let local_tag = inv.from_header()?.tag()?.unwrap().value().to_string();
-    let call_id = inv.call_id_header()?.value().to_string();
-
-    // The callee re-INVITEs us; the application answers it.
-    let reinvite = format!(
-        "INVITE sip:alice@{uac} SIP/2.0\r\n\
-         Via: SIP/2.0/UDP {callee_addr};branch=z9hG4bK-callee-reinvite\r\n\
-         Max-Forwards: 70\r\n\
-         From: <sip:bob@{callee_addr}>;tag={CALLEE_TAG}\r\n\
-         To: <sip:alice@example.com>;tag={local_tag}\r\n\
-         Call-ID: {call_id}\r\n\
-         CSeq: 7 INVITE\r\n\
-         Contact: <sip:bob@{callee_addr}>\r\n\
-         Content-Length: 0\r\n\r\n"
-    );
-    callee.send_to(reinvite.as_bytes(), uac).await?;
-    let handle = loop {
-        let state = tokio::time::timeout(Duration::from_secs(2), states.recv())
-            .await
-            .expect("timeout waiting for the re-INVITE")
-            .expect("state channel closed");
-        if let DialogState::Updated(_, _, handle) = state {
-            break handle;
-        }
-    };
-    let answered = Instant::now();
-    handle.reply(crate::sip::StatusCode::OK).await.ok();
-
-    // The callee never ACKs. Collect what we send, answering the BYE.
-    let peer = Peer {
-        socket: callee,
-        uas: uac,
-    };
-    let messages = peer.collect(answered + T1X64 * 2).await;
-    let seen = drain(&mut states);
-    assert_reinvite_teardown(&messages, &seen, answered, 7, |bye| {
-        bye.from_header().unwrap().tag().unwrap().unwrap().value() == local_tag
-            && bye.to_header().unwrap().tag().unwrap().unwrap().value() == CALLEE_TAG
-    });
-    assert_eq!(
-        dialog.take_reinvite_ack(),
-        Some(ReinviteAck::TimedOut { cseq: 7 })
-    );
-    assert!(dialog.state().is_terminated());
-    token.cancel();
-    Ok(())
 }
 
 /// Read SIP messages (no bodies) from `stream` until `deadline`.
@@ -884,53 +672,282 @@ async fn test_2xx_over_tcp_is_retransmitted_until_the_ack() -> crate::Result<()>
     Ok(())
 }
 
-/// Two re-INVITE transactions are outstanding. The first (CSeq 2) times out
-/// and ends the session; the ACK of the second (CSeq 3) arrives after that.
-/// The terminal `TimedOut { cseq: 2 }` must still be what the consumer reads.
+/// An ACK whose CSeq does not match the INVITE (RFC 3261 §13.2.2.4: e.g. a
+/// delayed ACK of an earlier re-INVITE) must not confirm the server INVITE
+/// transaction: the 2xx keeps being retransmitted, and a later ACK with the
+/// matching CSeq still confirms the dialog — without any BYE.
 #[tokio::test]
-async fn test_reinvite_timeout_outcome_is_not_replaced_by_a_later_ack() -> crate::Result<()> {
+async fn test_stale_ack_is_ignored_and_a_valid_ack_still_confirms() -> crate::Result<()> {
     let token = CancellationToken::new();
     let (mut states, mut dialogs, peer) = setup(&token, short_timers()).await?;
-    let (dialog, local_tag, answered) = answer_reinvite(&mut states, &mut dialogs, &peer).await?;
 
-    // Half-way through re-INVITE 2's wait, the peer sends re-INVITE 3.
-    peer.collect(answered + T1X64 / 2).await;
-    peer.send_request(Method::Invite, 3, Some(&local_tag)).await;
+    peer.send_request(Method::Invite, 1, None).await;
+    let dialog = tokio::time::timeout(Duration::from_secs(2), dialogs.recv())
+        .await
+        .expect("timeout waiting for the server dialog")
+        .unwrap();
+    dialog.accept(None, None)?;
+
+    // The first 200 OK; remember its To tag for the ACKs.
+    let mut buf = vec![0u8; 4096];
+    let to_tag = loop {
+        let Ok(Ok((len, _))) =
+            tokio::time::timeout(Duration::from_secs(2), peer.socket.recv_from(&mut buf)).await
+        else {
+            panic!("timeout waiting for the first 200");
+        };
+        let text = std::str::from_utf8(&buf[..len]).unwrap();
+        if let Ok(SipMessage::Response(resp)) = SipMessage::try_from(text) {
+            if resp.status_code.code() == 200 {
+                break resp
+                    .to_header()?
+                    .tag()?
+                    .expect("the 200 must carry the local tag")
+                    .value()
+                    .to_string();
+            }
+        }
+    };
+
+    // An ACK with a stale CSeq must be ignored: the 2xx keeps being
+    // retransmitted (Timer G must not stop).
+    peer.send_request(Method::Ack, 99, Some(&to_tag)).await;
+    let stale_at = Instant::now();
+    let retransmitted_after_stale = loop {
+        let now = Instant::now();
+        if now >= stale_at + T1X64 / 2 {
+            break None;
+        }
+        let Ok(Ok((len, _))) =
+            tokio::time::timeout(stale_at + T1X64 / 2 - now, peer.socket.recv_from(&mut buf)).await
+        else {
+            break None;
+        };
+        let text = std::str::from_utf8(&buf[..len]).unwrap();
+        if let Ok(SipMessage::Response(resp)) = SipMessage::try_from(text) {
+            if resp.status_code.code() == 200 {
+                break Some(Instant::now());
+            }
+        }
+    };
+    let retransmitted_after_stale = retransmitted_after_stale.expect(
+        "a stale ACK must not confirm the transaction: the 2xx must keep being retransmitted",
+    );
+    assert!(
+        retransmitted_after_stale >= stale_at,
+        "the 2xx retransmission must come after the stale ACK"
+    );
+    assert!(
+        !matches!(dialog.state(), DialogState::Confirmed(_, _)),
+        "a stale ACK must not confirm the dialog, got {}",
+        dialog.state()
+    );
+
+    // The ACK with the matching CSeq confirms; no BYE may follow.
+    peer.send_request(Method::Ack, 1, Some(&to_tag)).await;
+    let messages = peer
+        .collect(Instant::now() + T1X64 + Duration::from_millis(200))
+        .await;
+    assert!(
+        !messages.iter().any(|(_, m)| matches!(
+            m,
+            SipMessage::Request(req) if req.method == Method::Bye
+        )),
+        "a confirmed dialog must not be ended with a BYE"
+    );
+    assert!(
+        dialog.state().is_confirmed(),
+        "the valid ACK must confirm the dialog, got {}",
+        dialog.state()
+    );
+    assert!(
+        !states
+            .try_recv()
+            .is_ok_and(|s| matches!(s, DialogState::Terminated(_, _))),
+        "the dialog must not have been terminated"
+    );
+    token.cancel();
+    Ok(())
+}
+
+/// RFC 3261 §13.2.2.4: the ACK of a 2xx carries the CSeq number of its
+/// INVITE. Over UDP the ACK of a re-INVITE can arrive after the next
+/// re-INVITE on the dialog: it must still stop its own 2xx, and the newer
+/// re-INVITE must still wait for its own ACK.
+#[tokio::test]
+async fn test_late_ack_of_an_earlier_reinvite_reaches_its_own_transaction() -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let (mut states, mut dialogs, peer) = setup(&token, short_timers()).await?;
+    peer.send_request(Method::Invite, 1, None).await;
+    let dialog = tokio::time::timeout(Duration::from_secs(2), dialogs.recv())
+        .await
+        .expect("timeout waiting for the server dialog")
+        .unwrap();
+    dialog.accept(None, None)?;
+    let first = peer.collect(Instant::now() + T1 * 2).await;
+    let Some((_, SipMessage::Response(ok))) = first.iter().find(|(_, m)| is_2xx_to(m, 1)) else {
+        panic!("the 2xx");
+    };
+    let local_tag = ok.to_header()?.tag()?.unwrap().value().to_string();
+    peer.send_request(Method::Ack, 1, Some(&local_tag)).await;
+    wait_confirmed(&mut states).await;
+
+    // re-INVITE 2 and 3 are answered; the ACK of 2 arrives after re-INVITE 3.
+    let mut answered = None;
+    for cseq in [2, 3] {
+        peer.send_request(Method::Invite, cseq, Some(&local_tag))
+            .await;
+        let handle = loop {
+            let state = tokio::time::timeout(Duration::from_secs(2), states.recv())
+                .await
+                .expect("timeout waiting for the re-INVITE")
+                .expect("state channel closed");
+            if let DialogState::Updated(_, _, handle) = state {
+                break handle;
+            }
+        };
+        answered.get_or_insert(Instant::now());
+        handle.reply(crate::sip::StatusCode::OK).await.ok();
+        // The next request follows this 2xx on the wire.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !peer
+            .collect(Instant::now() + T1)
+            .await
+            .iter()
+            .any(|(_, m)| is_2xx_to(m, cseq))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "timeout waiting for the 2xx to {cseq}"
+            );
+        }
+    }
+    peer.send_request(Method::Ack, 2, Some(&local_tag)).await;
+    let acked_2 = Instant::now();
+    let messages = peer.collect(acked_2 + T1 * 16).await;
+    assert!(
+        !messages
+            .iter()
+            .any(|(at, m)| is_2xx_to(m, 2) && *at > acked_2 + T1 * 4),
+        "the late ACK of CSeq 2 must stop the retransmissions of its 2xx"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|(at, m)| is_2xx_to(m, 3) && *at > acked_2),
+        "the ACK of CSeq 2 must not stop the 2xx to CSeq 3"
+    );
+
+    peer.send_request(Method::Ack, 3, Some(&local_tag)).await;
+    let acked_3 = Instant::now();
+    let messages = peer.collect(answered.unwrap() + T1X64 + T1 * 10).await;
+    assert!(
+        !messages
+            .iter()
+            .any(|(at, m)| is_invite_2xx(m) && *at > acked_3 + T1 * 4),
+        "no 2xx may be retransmitted once both are ACKed"
+    );
+    assert!(
+        !messages.iter().any(|(_, m)| matches!(
+            m,
+            SipMessage::Request(req) if req.method == Method::Bye
+        )),
+        "an ACKed call must not be ended"
+    );
+    assert!(terminated_reason(&mut states).is_none());
+    assert!(dialog.state().is_confirmed());
+    token.cancel();
+    Ok(())
+}
+
+/// Regression guard for the Accepted-state ACK handling: a re-INVITE whose
+/// 2xx IS acknowledged must never trip the no-ACK timeout path — the dialog
+/// stays confirmed and no BYE goes out.
+#[tokio::test]
+async fn test_acked_reinvite_sends_no_bye() -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let (mut states, mut dialogs, peer) = setup(&token, short_timers()).await?;
+
+    peer.send_request(Method::Invite, 1, None).await;
+    let dialog = tokio::time::timeout(Duration::from_secs(2), dialogs.recv())
+        .await
+        .expect("timeout waiting for the server dialog")
+        .unwrap();
+    dialog.accept(None, None)?;
+
+    // First 200 OK and its ACK.
+    let mut buf = vec![0u8; 4096];
+    let to_tag = loop {
+        let Ok(Ok((len, _))) =
+            tokio::time::timeout(Duration::from_secs(2), peer.socket.recv_from(&mut buf)).await
+        else {
+            panic!("timeout waiting for the first 200");
+        };
+        let text = std::str::from_utf8(&buf[..len]).unwrap();
+        if let Ok(SipMessage::Response(resp)) = SipMessage::try_from(text) {
+            if resp.status_code.code() == 200 {
+                break resp
+                    .to_header()?
+                    .tag()?
+                    .expect("the 200 must carry the local tag")
+                    .value()
+                    .to_string();
+            }
+        }
+    };
+    peer.send_request(Method::Ack, 1, Some(&to_tag)).await;
+
+    // A re-INVITE answered and ACKed: the session must go on.
+    peer.send_request(Method::Invite, 2, Some(&to_tag)).await;
     let handle = loop {
         let state = tokio::time::timeout(Duration::from_secs(2), states.recv())
             .await
-            .expect("timeout waiting for re-INVITE 3")
+            .expect("timeout waiting for the re-INVITE")
             .expect("state channel closed");
         if let DialogState::Updated(_, _, handle) = state {
             break handle;
         }
     };
+    let reinvite_answered = Instant::now();
     handle.reply(crate::sip::StatusCode::OK).await.ok();
+    let mut got_reinvite_2xx = false;
+    while !got_reinvite_2xx {
+        let Ok(Ok((len, _))) =
+            tokio::time::timeout(Duration::from_secs(2), peer.socket.recv_from(&mut buf)).await
+        else {
+            panic!("timeout waiting for the re-INVITE's 200");
+        };
+        let text = std::str::from_utf8(&buf[..len]).unwrap();
+        if let Ok(SipMessage::Response(resp)) = SipMessage::try_from(text) {
+            if resp.status_code.code() == 200 {
+                got_reinvite_2xx = true;
+            }
+        }
+    }
+    peer.send_request(Method::Ack, 2, Some(&to_tag)).await;
 
-    // Re-INVITE 2 times out: BYE and Terminated(Timeout).
-    let messages = peer.collect(answered + T1X64 + T1 * 10).await;
+    // No BYE within 64*T1 after the re-INVITE's ACK.
+    let messages = peer
+        .collect(reinvite_answered + T1X64 + Duration::from_millis(200))
+        .await;
     assert!(
-        messages.iter().any(|(_, m)| matches!(
+        !messages.iter().any(|(_, m)| matches!(
             m,
             SipMessage::Request(req) if req.method == Method::Bye
         )),
-        "re-INVITE 2's missing ACK must end the session"
+        "a confirmed re-INVITE must not end the session with a BYE"
     );
-    // Re-INVITE 3's transaction is still waiting; its ACK arrives now.
-    peer.send_request(Method::Ack, 3, Some(&local_tag)).await;
-    peer.collect(Instant::now() + T1 * 10).await;
-
-    let seen = drain(&mut states);
     assert!(
-        seen.iter()
-            .any(|s| matches!(s, DialogState::Terminated(_, TerminatedReason::Timeout))),
-        "got {seen:?}"
+        dialog.state().is_confirmed(),
+        "the dialog must stay confirmed after the re-INVITE's ACK, got {}",
+        dialog.state()
     );
-    assert_eq!(
-        dialog.take_reinvite_ack(),
-        Some(ReinviteAck::TimedOut { cseq: 2 }),
-        "the timeout that ended the session must not be replaced"
-    );
+    while let Ok(state) = states.try_recv() {
+        assert!(
+            !matches!(state, DialogState::Terminated(_, _)),
+            "the dialog must not have been terminated"
+        );
+    }
     token.cancel();
     Ok(())
 }
