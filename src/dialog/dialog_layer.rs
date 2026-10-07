@@ -1,18 +1,18 @@
-use crate::prelude::*;
 use super::authenticate::Credential;
 use super::dialog::{DialogSnapshot, DialogStateSender};
 use super::publication::{ClientPublicationDialog, ServerPublicationDialog};
 use super::subscription::{ClientSubscriptionDialog, ServerSubscriptionDialog};
 use super::{dialog::Dialog, invite_dialog::InviteDialog, DialogId};
+use crate::prelude::*;
 
 use crate::dialog::dialog::{DialogInner, DialogStateReceiver};
+use crate::platform::sync::RwMap;
 use crate::sip::prelude::HeadersExt;
 use crate::transaction::key::TransactionRole;
 use crate::transaction::make_tag;
 use crate::transaction::transaction::transaction_event_sender_noop;
 use crate::transaction::{endpoint::EndpointInnerRef, transaction::Transaction};
 use crate::Result;
-use crate::platform::sync::RwMap;
 use core::sync::atomic::{AtomicU32, Ordering};
 use tracing::debug;
 
@@ -154,7 +154,7 @@ impl DialogLayer {
     ) -> Result<InviteDialog> {
         let mut id = DialogId::try_from(tx)?;
         if !id.local_tag.is_empty() {
-            let dlg = self.inner.dialogs.get(&id.to_string()).map(|d| d.clone());
+            let dlg = self.inner.dialogs.get(&id.to_string());
             match dlg {
                 // Only a UAS dialog answers an in-dialog request here, as the
                 // role-typed `Dialog::ServerInvite` did before the unified
@@ -227,7 +227,7 @@ impl DialogLayer {
     ) -> Result<ServerSubscriptionDialog> {
         let mut id = DialogId::try_from(tx)?;
         if !id.local_tag.is_empty() {
-            let dlg = self.inner.dialogs.get(&id.to_string()).map(|d| d.clone());
+            let dlg = self.inner.dialogs.get(&id.to_string());
             match dlg {
                 Some(Dialog::ServerSubscription(dlg)) => return Ok(dlg),
                 _ => {
@@ -281,7 +281,7 @@ impl DialogLayer {
     ) -> Result<ServerPublicationDialog> {
         let mut id = DialogId::try_from(tx)?;
         if !id.local_tag.is_empty() {
-            let dlg = self.inner.dialogs.get(&id.to_string()).map(|d| d.clone());
+            let dlg = self.inner.dialogs.get(&id.to_string());
             match dlg {
                 Some(Dialog::ServerPublication(dlg)) => return Ok(dlg),
                 _ => {
@@ -444,7 +444,7 @@ impl DialogLayer {
     }
 
     pub fn get_dialog_with(&self, id: &String) -> Option<Dialog> {
-        self.inner.dialogs.get(id).map(|d| d.clone())
+        self.inner.dialogs.get(id)
     }
     /// Returns all client-side INVITE dialogs (UAC) that share the given Call-ID.
     ///
@@ -527,10 +527,10 @@ impl DialogLayer {
     /// its teardown. Like `remove_dialog`, the dialog's cancel token is
     /// cancelled.
     pub fn take_dialog(&self, id: &DialogId) -> Option<Dialog> {
-        self.inner.dialogs.remove(&id.to_string()).map(|d| {
-            d.on_remove();
-            d
-        })
+        self.inner
+            .dialogs
+            .remove(&id.to_string())
+            .inspect(|d| d.on_remove())
     }
 
     pub fn match_dialog(&self, tx: &Transaction) -> Option<Dialog> {

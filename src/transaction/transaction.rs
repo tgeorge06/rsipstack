@@ -1,8 +1,9 @@
-use crate::prelude::*;
 use super::endpoint::EndpointInnerRef;
 use super::key::TransactionKey;
 use super::{SipConnection, TransactionState, TransactionTimer, TransactionType};
 use crate::dialog::DialogId;
+use crate::platform::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use crate::prelude::*;
 use crate::sip::{
     ContentLength, HasHeaders, Header, HeadersExt, Method, Request, Response, SipMessage,
     StatusCode, StatusCodeKind,
@@ -11,7 +12,6 @@ use crate::transaction::key::TransactionRole;
 use crate::transaction::make_tag;
 use crate::transport::SipAddr;
 use crate::{Error, Result};
-use crate::platform::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, trace, warn};
 
 pub type TransactionEventReceiver = UnboundedReceiver<TransactionEvent>;
@@ -65,6 +65,7 @@ pub enum TransactionEvent {
 /// Useful for restoring dialogs after restart when a real transaction-user channel
 /// is not available yet.
 pub fn transaction_event_sender_noop() -> TransactionEventSender {
+    #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
     let (tx, mut rx) = unbounded_channel::<TransactionEvent>();
     crate::platform::spawn(async move {
         while let Some(_ev) = rx.recv().await {
@@ -188,7 +189,9 @@ pub struct Transaction {
     pub timer_c: Option<u64>,
     pub timer_d: Option<u64>,
     pub timer_k: Option<u64>, // server invite only
-    pub timer_g: Option<u64>, // server invite only
+    pub timer_g: Option<u64>, // server invite only (non-2xx final response retransmits per RFC 6026 §7.1)
+    pub timer_l: Option<u64>, // server invite only (Accepted-state 64*T1 per RFC 6026 §7.1)
+    pub timer_m: Option<u64>, // client invite only (Accepted-state 64*T1 per RFC 6026 §7.2)
     retransmission: bool,
     is_cleaned_up: bool,
     /// Called once, on the first successful transport write of the request,
@@ -234,6 +237,8 @@ impl Transaction {
             timer_k: None,
             timer_g: None,
             retransmission: true,
+            timer_l: None,
+            timer_m: None,
             tu_receiver,
             tu_sender,
             is_cleaned_up: false,
@@ -444,7 +449,35 @@ impl Transaction {
     pub async fn reply(&mut self, status_code: StatusCode) -> Result<()> {
         self.reply_with(status_code, vec![], None).await
     }
-    // send server response
+    /// Send a server response.
+    ///
+    /// Validates the state transition, sends the response through the
+    /// transaction's connection, stores it as `last_response`, and
+    /// transitions the state machine. The response routing follows
+    /// RFC 3261 §17.2.1 + RFC 6026 §7.1 (server INVITE 2xx → Accepted;
+    /// server INVITE 3xx-6xx → Completed; server non-INVITE → Terminated).
+    ///
+    /// # Errors
+    /// Returns `Error::TransactionError` if:
+    /// - the transaction is a client transaction (`respond` is server-only),
+    /// - the requested transition is not allowed by `can_transition`,
+    /// - the connection is missing,
+    /// - the underlying transport send fails.
+    ///
+    /// # Cancel safety
+    ///
+    /// **NOT cancel-safe.** The mutation order is: store `last_response`
+    /// → `await` the transport send → transition the state machine. If the
+    /// future is dropped during the `await`, `last_response` will already
+    /// be updated while the response may have been only partially
+    /// transmitted (or not at all) and the state did not advance. If it
+    /// is dropped between the send completing and the transition, the
+    /// response is on the wire but the transaction remains in the previous
+    /// state and subsequent timer-driven retransmits may fire incorrectly.
+    /// Drive `respond` from an owning task; do not place it directly
+    /// inside `tokio::select!` / `tokio::time::timeout` unless this hazard
+    /// is acceptable. Prefer the `TransactionEvent::Respond` channel for
+    /// cancellation-aware integration.
     pub async fn respond(&mut self, response: Response) -> Result<()> {
         match self.transaction_type {
             TransactionType::ServerInvite | TransactionType::ServerNonInvite => {}
@@ -461,6 +494,20 @@ impl Transaction {
                 StatusCode::Trying => TransactionState::Trying,
                 _ => TransactionState::Proceeding,
             },
+            StatusCodeKind::Successful => match self.transaction_type {
+                // RFC 6026 §7.1: server INVITE 2xx routes to Accepted, NOT
+                // Completed. Pre-RFC-6026 behaviour incorrectly used the
+                // Completed state — that triggered Timer G 2xx retransmits
+                // (forbidden by §7.1) and used Timer K (T4 ≈ 5s) as the
+                // effective ACK window instead of Timer L (64*T1 ≈ 32s),
+                // causing spurious failures on proxy-chain ACK fan-in.
+                TransactionType::ServerInvite => TransactionState::Accepted,
+                // ServerNonInvite 2xx → Terminated (no ACK expected).
+                _ => TransactionState::Terminated,
+            },
+            // Non-2xx final response (3xx, 4xx, 5xx, 6xx): RFC 3261 §17.2.1
+            // semantics retained — server INVITE → Completed (waits for
+            // ACK + Timer K + Timer D); server non-INVITE → Terminated.
             _ => match self.transaction_type {
                 TransactionType::ServerInvite => TransactionState::Completed,
                 _ => TransactionState::Terminated,
@@ -501,17 +548,22 @@ impl Transaction {
             | (&TransactionState::Calling, &TransactionState::Calling)
             | (&TransactionState::Calling, &TransactionState::Trying)
             | (&TransactionState::Calling, &TransactionState::Proceeding)
+            | (&TransactionState::Calling, &TransactionState::Accepted) // RFC 6026 §7.2
             | (&TransactionState::Calling, &TransactionState::Completed)
             | (&TransactionState::Calling, &TransactionState::Terminated)
             | (&TransactionState::Trying, &TransactionState::Trying) // retransmission
             | (&TransactionState::Trying, &TransactionState::Proceeding)
+            | (&TransactionState::Trying, &TransactionState::Accepted) // RFC 6026 §7.1/§7.2
             | (&TransactionState::Trying, &TransactionState::Completed)
             | (&TransactionState::Trying, &TransactionState::Confirmed)
             | (&TransactionState::Trying, &TransactionState::Terminated)
             | (&TransactionState::Proceeding, &TransactionState::Proceeding)
+            | (&TransactionState::Proceeding, &TransactionState::Accepted) // RFC 6026 §7.1/§7.2
             | (&TransactionState::Proceeding, &TransactionState::Completed)
             | (&TransactionState::Proceeding, &TransactionState::Confirmed)
             | (&TransactionState::Proceeding, &TransactionState::Terminated)
+            | (&TransactionState::Accepted, &TransactionState::Accepted) // RFC 6026 §7.1: absorb 2xx retransmits
+            | (&TransactionState::Accepted, &TransactionState::Terminated) // RFC 6026 §7.1/§7.2: Timer L/M fires
             | (&TransactionState::Completed, &TransactionState::Confirmed)
             | (&TransactionState::Completed, &TransactionState::Terminated)
             | (&TransactionState::Confirmed, &TransactionState::Terminated) => Ok(()),
@@ -555,6 +607,40 @@ impl Transaction {
         }
     }
 
+    /// Send an ACK for a final response on a client INVITE transaction.
+    ///
+    /// Constructs the ACK from `last_ack` (cached) or `last_response` +
+    /// the original INVITE, resolves the destination (Contact for 2xx
+    /// per RFC 3261 §13.2.2.4; Via/Record-Route for 3xx-6xx per §17.1.1.3),
+    /// and sends through either the supplied `connection` argument or, for
+    /// 2xx responses, a transport-layer connection looked up from the
+    /// resolved Contact. For connection-oriented transports the ACK reuses
+    /// the flow the response arrived on (RFC 7118 §5) instead of dialing
+    /// the Record-Route/Contact target. The ACK is recorded as `last_ack`
+    /// regardless of send outcome.
+    ///
+    /// State transitions per RFC 6026 §7.2 + RFC 3261 §17.1.1.3:
+    /// - Completed (3xx-6xx): transitions to Terminated.
+    /// - Accepted (2xx): no transition (Timer M drives Termination so
+    ///   the §7.2 server-retransmitted-2xx absorption window is preserved).
+    ///
+    /// # Errors
+    /// Returns `Error::TransactionError` if:
+    /// - the transaction is not a client INVITE,
+    /// - the state is neither Completed nor Accepted,
+    /// - no `last_response` and no `last_ack` is available,
+    /// - destination resolution or transport send fails.
+    ///
+    /// # Cancel safety
+    ///
+    /// **NOT cancel-safe.** This method has multiple `.await` points
+    /// (locator lookup, transport lookup, transport send) interleaved
+    /// with `last_ack` mutation and state transition. If the future is
+    /// dropped between the ACK transmission and the state transition,
+    /// the ACK will have been sent but the transaction state will remain
+    /// in Completed/Accepted. The next inbound message may trigger
+    /// inappropriate retransmits. Do not place inside `tokio::select!`
+    /// unless this hazard is acceptable.
     pub async fn send_ack(&mut self, mut connection: Option<SipConnection>) -> Result<()> {
         if self.transaction_type != TransactionType::ClientInvite {
             return Err(Error::TransactionError(
@@ -564,7 +650,7 @@ impl Transaction {
         }
 
         match self.state {
-            TransactionState::Completed => {} // must be in completed state, to send ACK
+            TransactionState::Completed | TransactionState::Accepted => {} // RFC 3261 §17.1.1 (Completed, 3xx-6xx) or RFC 6026 §7.2 (Accepted, 2xx)
             _ => {
                 return Err(Error::TransactionError(
                     format!("invalid state for sending ACK {:?}", self.state),
@@ -573,16 +659,22 @@ impl Transaction {
             }
         }
         let mut ack = match self.last_ack.clone() {
-            Some(ack) => ack,
-            None => match self.last_response {
-                Some(ref resp) => self.endpoint_inner.make_ack(&self.original, resp)?,
-                None => {
-                    return Err(Error::TransactionError(
-                        "no last response found to send ACK".to_string(),
-                        self.key.clone(),
-                    ));
-                }
-            },
+            // A retransmission of the same 2xx re-uses the cached ACK. A
+            // forked 2xx (different To tag) establishes a different dialog
+            // (RFC 3261 §13.2.2.4): rebuild the ACK from that response so it
+            // carries its To tag, remote target and route set (§12.2.1.1).
+            // Non-2xx finals have a single branch — the cached ACK always
+            // matches there.
+            Some(ack) if Self::cached_ack_matches_response(&ack, self.last_response.as_ref()) => {
+                ack
+            }
+            _ => {
+                let resp = self.last_response.as_ref().ok_or(Error::TransactionError(
+                    "no last response found to send ACK".to_string(),
+                    self.key.clone(),
+                ))?;
+                self.endpoint_inner.make_ack(&self.original, resp)?
+            }
         };
         // A 2xx ACK carries the armed body: the UAC's answer to the offer the
         // 2xx brought (RFC 3261 §14.2). Only a 2xx ACK consumes it: the ACK
@@ -681,16 +773,55 @@ impl Transaction {
         } else {
             debug!(key = %self.key, "no connection for ack");
         }
-        // client send ack and transition to Terminated
-        self.transition(TransactionState::Terminated).map(|_| ())
+        // RFC 3261 §17.1.1.3 / RFC 6026 §7.2: ACK in Completed (3xx-6xx)
+        // immediately terminates the client transaction. ACK in Accepted
+        // (2xx) leaves the transaction in Accepted to absorb server-
+        // retransmitted 2xx duplicates per §7.2; Timer M drives the
+        // eventual transition to Terminated. Returning Ok(()) here lets
+        // the caller observe a successful ACK send without forcing a
+        // premature transition.
+        if self.state == TransactionState::Completed {
+            self.transition(TransactionState::Terminated).map(|_| ())
+        } else {
+            debug_assert_eq!(
+                self.state,
+                TransactionState::Accepted,
+                "send_ack reached post-send dispatch in unexpected state; the entry guard restricts to Completed|Accepted",
+            );
+            Ok(())
+        }
     }
 
-    /// Receive the next message for the transaction.
+    /// Receive the next SIP message routed to this transaction.
+    ///
+    /// Loops on the transaction's TU receiver, dispatching incoming
+    /// requests/responses through `on_received_request` /
+    /// `on_received_response`, processing timer events via `on_timer`,
+    /// and forwarding `Respond` events through `respond`. Returns
+    /// `Some(msg)` when a request/response should be propagated to the
+    /// dialog/TU layer; returns `None` when the transaction is
+    /// terminated by a `Terminate` event or the underlying channel
+    /// closes.
     ///
     /// INVITE 2xx responses containing another Via hop are delivered without
     /// an automatic ACK, including retransmissions. Forwarding applications
     /// should retain the transaction and keep receiving until this returns None;
     /// the cleanup deadline is measured from the first such final response.
+    ///
+    /// # Cancel safety
+    ///
+    /// **NOT cancel-safe.** State mutations may occur around any inner
+    /// `.await` — for example, an incoming response is passed to
+    /// `on_received_response` which transitions state and stores
+    /// `last_response` BEFORE the message is returned to the caller.
+    /// If the future is dropped between those mutations and the
+    /// `return Some(msg)`, the TU will not observe the response while
+    /// the transaction has already advanced state. Drive
+    /// `Transaction::receive` from an owning task; do not place it
+    /// directly inside `tokio::select!` / `tokio::time::timeout` unless
+    /// dropped state is acceptable. If timeout is required, prefer a
+    /// dedicated cancellation channel that the transaction itself
+    /// observes via `TransactionEvent::Terminate`.
     pub async fn receive(&mut self) -> Option<SipMessage> {
         while let Some(event) = self.tu_receiver.recv().await {
             match event {
@@ -725,9 +856,7 @@ impl Transaction {
         self.retransmission = false;
         self.timer_a
             .take()
-            .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+            .map(|id| -> Option<TransactionTimer> { self.endpoint_inner.timers.cancel(id) });
     }
 
     pub async fn send_trying(&mut self) -> Result<()> {
@@ -814,13 +943,54 @@ impl Transaction {
                     self.respond(last_response.to_owned()).await.ok();
                 }
             }
+            TransactionState::Accepted => {
+                // RFC 6026 §7.1: server INVITE Accepted state.
+                //
+                // ACK received: pass to TU; remain in Accepted (transition to
+                // Terminated is driven by Timer L expiry, not by ACK arrival
+                // — §7.1 'Timer L reflects the amount of time the server
+                // transaction could receive 2xx responses for retransmission
+                // from the TU while it is waiting to receive an ACK').
+                //
+                // INVITE retransmit: silently absorbed. Per §7.1 the server
+                // transaction MUST NOT retransmit the 2xx on its own (only
+                // the TU does, via respond()), so re-firing respond() here
+                // would re-issue the 2xx through the transport AND trigger
+                // a no-op Accepted-self-loop transition. Just drop.
+                //
+                // As in Completed/Confirmed, an ACK carries the CSeq number
+                // of the INVITE it acknowledges (RFC 3261 §13.2.2.4): a
+                // delayed ACK of an earlier re-INVITE routed here through
+                // `waiting_ack` must not be delivered to the TU of this
+                // transaction.
+                if req.method == Method::Ack {
+                    let ack_seq = req.cseq_header().and_then(|c| c.seq()).ok();
+                    let invite_seq = self.original.cseq_header().and_then(|c| c.seq()).ok();
+                    if ack_seq != invite_seq {
+                        debug!(
+                            key = %self.key,
+                            ?ack_seq,
+                            ?invite_seq,
+                            "ignoring ACK with a CSeq that does not match the INVITE"
+                        );
+                        return None;
+                    }
+                    // The peer confirmed the dialog: stop the 2xx
+                    // retransmissions (RFC 3261 §13.3.1.4) and end the
+                    // transaction. Retransmitted ACKs and late INVITE
+                    // retransmissions are absorbed below the TU by
+                    // `finished_transactions`.
+                    self.transition(TransactionState::Terminated).ok();
+                    return Some(req.into());
+                }
+            }
             TransactionState::Completed | TransactionState::Confirmed
                 if req.method == Method::Ack =>
             {
                 // RFC 3261 §17.1.1.3 / §13.2.2.4: an ACK carries the CSeq
                 // number of the INVITE it acknowledges. ACKs for 2xx are
-                // routed per dialog (`waiting_ack`), so a delayed ACK of an
-                // earlier re-INVITE can land here; it must not confirm this
+                // routed by dialog and CSeq (`waiting_ack_cseq`); one with
+                // another CSeq that lands here anyway must not confirm this
                 // transaction or stop its 2xx retransmissions.
                 let ack_seq = req.cseq_header().and_then(|c| c.seq()).ok();
                 let invite_seq = self.original.cseq_header().and_then(|c| c.seq()).ok();
@@ -864,10 +1034,11 @@ impl Transaction {
         {
             // A response with an upstream Via belongs to a forwarding transaction.
             // Its TU must receive every 2xx, including retransmissions and forks,
-            // and the originating UA owns the ACK. Keep the first Timer D deadline.
-            if self.state != TransactionState::Completed {
-                self.can_transition(&TransactionState::Completed).ok()?;
-                self.transition(TransactionState::Completed).ok()?;
+            // and the originating UA owns the ACK. Keep the first Timer M deadline
+            // (RFC 6026 §7.2 Accepted window).
+            if self.state != TransactionState::Accepted {
+                self.can_transition(&TransactionState::Accepted).ok()?;
+                self.transition(TransactionState::Accepted).ok()?;
             }
             self.last_response.replace(resp.clone());
             return Some(SipMessage::Response(resp));
@@ -880,7 +1051,28 @@ impl Transaction {
                     TransactionState::Proceeding
                 }
             }
+            StatusCodeKind::Successful => {
+                if self.transaction_type == TransactionType::ClientInvite {
+                    if !self.endpoint_inner.option.auto_ack_2xx {
+                        // auto_ack_2xx = false (proxy mode): a 2xx terminates
+                        // the client INVITE transaction at once; the ACK is
+                        // the TU's job (RFC 3261 section 17.1.1.2).
+                        TransactionState::Terminated
+                    } else {
+                        // RFC 6026 §7.2: client INVITE 2xx routes to Accepted
+                        // with Timer M = 64*T1 as the server-retransmitted-2xx
+                        // absorption window. The convenience auto-ACK still
+                        // fires below (rsipstack 0.5.x UA behavior; the strict
+                        // §7.2 TU-owned ACK can be had with auto_ack_2xx =
+                        // false).
+                        TransactionState::Accepted
+                    }
+                } else {
+                    TransactionState::Terminated
+                }
+            }
             _ => {
+                // 3xx-6xx final response: RFC 3261 §17.1.1 unchanged.
                 if self.transaction_type == TransactionType::ClientInvite {
                     TransactionState::Completed
                 } else {
@@ -890,7 +1082,21 @@ impl Transaction {
         };
 
         self.can_transition(&new_state).ok()?;
-        if self.state == new_state {
+
+        // RFC 6026 §7.2: every 2xx response received by a client INVITE in
+        // the Accepted state MUST be passed to the TU — both genuine
+        // server-retransmitted 2xx (which the TU/dialog re-acknowledges)
+        // and forked 2xx (which can share status code + body but differ
+        // in To-tag and so identify a different dialog). The pre-existing
+        // duplicate-suppression filter below is correct for non-INVITE
+        // transactions where the TU has no use for duplicates, but applying
+        // it to the Accepted self-loop would silently swallow forked dialogs
+        // and prevent the legacy auto-ACK from re-firing per retransmit.
+        let is_client_invite_2xx_in_accepted = self.transaction_type
+            == TransactionType::ClientInvite
+            && new_state == TransactionState::Accepted;
+
+        if !is_client_invite_2xx_in_accepted && self.state == new_state {
             if let Some(last) = self.last_response.as_ref() {
                 if last.status_code == resp.status_code && last.body == resp.body {
                     // ignore duplicate response
@@ -900,20 +1106,63 @@ impl Transaction {
         }
 
         self.last_response.replace(resp.clone());
-        let is_completed_client_invite = self.transaction_type == TransactionType::ClientInvite
-            && new_state == TransactionState::Completed;
+        // Auto-ACK gate. Pre-RFC-6026 this fired only for new_state ==
+        // Completed (which captured both 2xx and 3xx-6xx in the old routing).
+        // Post-RFC-6026 split: 2xx → Accepted, 3xx-6xx → Completed. Both
+        // states still benefit from the convenience auto-ACK; the transaction
+        // layer constructs and sends the ACK via send_ack below. send_ack
+        // transitions Completed → Terminated (RFC 3261 §17.1.1) but leaves
+        // Accepted alone so Timer M can fire and the §7.2 2xx-retransmit
+        // absorption window is preserved.
+        let auto_ack_client_invite = self.transaction_type == TransactionType::ClientInvite
+            && (new_state == TransactionState::Completed
+                || new_state == TransactionState::Accepted);
 
         self.transition(new_state).ok();
 
-        if is_completed_client_invite {
-            // A lost ACK is a dialog that never confirms (the far end
-            // retransmits its 2xx until its timer expires): leave a trace.
+        if auto_ack_client_invite {
             if let Err(e) = self.send_ack(connection).await {
-                warn!(key = %self.key, error = %e, "ACK for the final response could not be sent");
+                warn!(
+                    key = %self.key,
+                    state = %self.state,
+                    error = %e,
+                    "auto-ACK for client INVITE final response failed; downstream TU may need to handle ACK explicitly",
+                );
             }
         }
 
         Some(SipMessage::Response(resp))
+    }
+
+    /// Retransmit `last_response` and re-arm Timer G with a doubled interval
+    /// capped at T2 (RFC 3261 §13.3.1.4 / §17.2.1). Used by both the
+    /// Completed (non-2xx) and Accepted (2xx) Timer G arms.
+    async fn retransmit_last_response(
+        &mut self,
+        key: &TransactionKey,
+        duration: &Duration,
+    ) -> Result<()> {
+        if let Some(last_response) = &self.last_response {
+            if let Some(connection) = &self.connection {
+                let last_response =
+                    if let Some(ref inspector) = self.endpoint_inner.message_inspector {
+                        inspector
+                            .before_send(last_response.to_owned().into(), self.destination.as_ref())
+                    } else {
+                        last_response.to_owned().into()
+                    };
+                connection
+                    .send(last_response, self.destination.as_ref())
+                    .await?;
+            }
+        }
+        let duration = (*duration * 2).min(self.endpoint_inner.option.t2);
+        let timer_g = self
+            .endpoint_inner
+            .timers
+            .timeout(duration, TransactionTimer::TimerG(key.clone(), duration));
+        self.timer_g.replace(timer_g);
+        Ok(())
     }
 
     async fn on_timer(&mut self, timer: TransactionTimer) -> Result<()> {
@@ -1002,35 +1251,65 @@ impl Transaction {
             }
             TransactionState::Completed => {
                 if let TransactionTimer::TimerG(key, duration) = timer {
-                    // resend the response
-                    if let Some(last_response) = &self.last_response {
-                        if let Some(connection) = &self.connection {
-                            let last_response = if let Some(ref inspector) =
-                                self.endpoint_inner.message_inspector
-                            {
-                                inspector.before_send(
-                                    last_response.to_owned().into(),
-                                    self.destination.as_ref(),
-                                )
-                            } else {
-                                last_response.to_owned().into()
-                            };
-                            connection
-                                .send(last_response, self.destination.as_ref())
-                                .await?;
-                        }
-                    }
-                    // restart Timer G, doubling up to T2 (RFC 3261 §13.3.1.4, §17.2.1)
-                    let duration = (duration * 2).min(self.endpoint_inner.option.t2);
-                    let timer_g = self
-                        .endpoint_inner
-                        .timers
-                        .timeout(duration, TransactionTimer::TimerG(key, duration));
-                    self.timer_g.replace(timer_g);
+                    // resend the response (non-2xx final — RFC 3261 §17.2.1;
+                    // 2xx finals route to Accepted, never here)
+                    self.retransmit_last_response(&key, &duration).await?;
                 } else if let TransactionTimer::TimerD(_) = timer {
                     self.transition(TransactionState::Terminated)?;
                 } else if let TransactionTimer::TimerK(_) = timer {
                     self.transition(TransactionState::Terminated)?;
+                }
+            }
+            TransactionState::Accepted => {
+                // RFC 6026 §7.1 (server INVITE Timer L) / §7.2 (client INVITE
+                // Timer M): on expiry the transaction transitions to
+                // Terminated. Timer L is server-only per §7.1; Timer M is
+                // client-only per §7.2 — mismatched pairings indicate a
+                // programming bug and are logged for visibility.
+                //
+                // Timer G (server): retransmit the 2xx with the interval
+                // doubling up to T2 (RFC 3261 §13.3.1.4) — see the
+                // documented Timer G deviation on the Accepted entry.
+                // Stray Timer A/B/C/D/K/Cleanup firings are race remnants
+                // from prior states (the Accepted-state entry handler
+                // cancels them, but fire-in-flight races are possible);
+                // listed explicitly so future timer additions force
+                // compile-time review here.
+                match (&self.transaction_type, &timer) {
+                    (TransactionType::ServerInvite, TransactionTimer::TimerL(_))
+                    | (TransactionType::ClientInvite, TransactionTimer::TimerM(_)) => {
+                        self.transition(TransactionState::Terminated)?;
+                    }
+                    (TransactionType::ServerInvite, TransactionTimer::TimerG(key, duration)) => {
+                        // retransmit the 2xx (documented Timer G deviation,
+                        // doubling up to T2 — RFC 3261 §13.3.1.4)
+                        self.retransmit_last_response(key, &duration).await?;
+                    }
+                    (
+                        TransactionType::ClientNonInvite
+                        | TransactionType::ServerNonInvite
+                        | TransactionType::ClientInvite,
+                        TransactionTimer::TimerG(_, _),
+                    ) => {
+                        warn!(
+                            key = %self.key,
+                            tx_type = %self.transaction_type,
+                            "Timer G fired outside the server Accepted state; ignoring",
+                        );
+                    }
+                    (_, TransactionTimer::TimerL(_) | TransactionTimer::TimerM(_)) => {
+                        warn!(
+                            key = %self.key,
+                            tx_type = %self.transaction_type,
+                            "RFC 6026 Accepted-state timer fired with mismatched transaction type",
+                        );
+                    }
+                    (_, TransactionTimer::TimerA(_, _))
+                    | (_, TransactionTimer::TimerB(_))
+                    | (_, TransactionTimer::TimerC(_))
+                    | (_, TransactionTimer::TimerD(_))
+                    | (_, TransactionTimer::TimerK(_))
+                    | (_, TransactionTimer::TimerCleanup(_)) => {}
                 }
             }
             TransactionState::Confirmed => {
@@ -1087,17 +1366,13 @@ impl Transaction {
                 }
             }
             TransactionState::Trying | TransactionState::Proceeding => {
-                self.timer_a
-                    .take()
-                    .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+                self.timer_a.take().map(|id| -> Option<TransactionTimer> {
+                    self.endpoint_inner.timers.cancel(id)
+                });
                 if matches!(self.transaction_type, TransactionType::ClientInvite) {
-                    self.timer_b
-                        .take()
-                        .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+                    self.timer_b.take().map(|id| -> Option<TransactionTimer> {
+                        self.endpoint_inner.timers.cancel(id)
+                    });
                     if self.timer_c.is_none() {
                         // start Timer C for client invite only
                         let timer_c = self.endpoint_inner.timers.timeout(
@@ -1108,39 +1383,138 @@ impl Transaction {
                     }
                 }
             }
-            TransactionState::Completed => {
+            TransactionState::Accepted => {
                 self.timer_a
                     .take()
-                    .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+                    .map(|id| self.endpoint_inner.timers.cancel(id));
                 self.timer_b
                     .take()
-                    .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+                    .map(|id| self.endpoint_inner.timers.cancel(id));
                 self.timer_c
                     .take()
-                    .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+                    .map(|id| self.endpoint_inner.timers.cancel(id));
+
+                match self.transaction_type {
+                    TransactionType::ServerInvite => {
+                        // RFC 6026 §7.1: server INVITE 2xx-Accepted entry.
+                        //
+                        // Start Timer L (64*T1). On expiry the transaction
+                        // transitions to Terminated (handled in on_timer for
+                        // the Accepted state).
+                        //
+                        // Register the dialog in `waiting_ack` so the dialog
+                        // layer can route the ACK for this 2xx back to this
+                        // transaction key.
+                        //
+                        // Timer G deviation (documented in lib.rs): strict
+                        // §7.1 leaves 2xx retransmission to the TU; the
+                        // rsipstack dialog layer does not retransmit, so the
+                        // transaction keeps Timer G (T1, doubling to T2) on
+                        // every transport — the wire behavior RFC 3261
+                        // §13.3.1.4 requires — until the ACK or Timer L.
+                        let timer_l = self.endpoint_inner.timers.timeout(
+                            self.endpoint_inner.option.t1x64,
+                            TransactionTimer::TimerL(self.key.clone()),
+                        );
+                        self.timer_l.replace(timer_l);
+
+                        let timer_g = self.endpoint_inner.timers.timeout(
+                            self.endpoint_inner.option.t1,
+                            TransactionTimer::TimerG(
+                                self.key.clone(),
+                                self.endpoint_inner.option.t1,
+                            ),
+                        );
+                        self.timer_g.replace(timer_g);
+
+                        if let Some(ref resp) = self.last_response {
+                            let dialog_id = DialogId::try_from((resp, TransactionRole::Server))?;
+                            // Route the ACK by dialog AND INVITE CSeq: the ACK
+                            // of an earlier re-INVITE can arrive after a newer
+                            // one was answered, and must reach its own
+                            // transaction (RFC 3261 §13.2.2.4). A non-2xx ACK
+                            // matches by branch (§17.2.3) — unreachable here,
+                            // Accepted only carries 2xx.
+                            let seq = self.original.cseq_header().and_then(|c| c.seq()).ok();
+                            if let Some(seq) = seq {
+                                self.endpoint_inner
+                                    .waiting_ack_cseq
+                                    .insert((dialog_id.clone(), seq), self.key.clone());
+                            }
+                            self.endpoint_inner
+                                .waiting_ack
+                                .insert(dialog_id, self.key.clone());
+                        }
+                        debug!(
+                            key = %self.key,
+                            "entered Accepted state (server); Timer L and Timer G armed, waiting for ACK"
+                        );
+                    }
+                    TransactionType::ClientInvite => {
+                        // RFC 6026 §7.2: client INVITE 2xx-Accepted entry.
+                        //
+                        // Start Timer M (64*T1). On expiry the transaction
+                        // transitions to Terminated. While in Accepted, the
+                        // client absorbs server-retransmitted 2xx responses
+                        // (these are forwarded to the TU as duplicates and
+                        // ignored by the transaction state machine itself —
+                        // see Accepted-self-loop edge in can_transition).
+                        //
+                        // Strict RFC 3261 §17.1.1.3 + RFC 6026 §7.2 make
+                        // the ACK for 2xx the TU's responsibility. For
+                        // rsipstack 0.5.x backward compatibility, the
+                        // auto_ack_client_invite gate at the tail of
+                        // on_received_response still emits that ACK after
+                        // entering Accepted; see lib.rs Standards Compliance
+                        // for the disclaimer. 3xx-6xx ACKs continue to be
+                        // sent by the transaction layer through the
+                        // Completed → Terminated path.
+                        let timer_m = self.endpoint_inner.timers.timeout(
+                            self.endpoint_inner.option.t1x64,
+                            TransactionTimer::TimerM(self.key.clone()),
+                        );
+                        self.timer_m.replace(timer_m);
+                        debug!(
+                            key = %self.key,
+                            "entered Accepted state (client); Timer M armed, awaiting expiry or 2xx retransmits"
+                        );
+                    }
+                    _ => {
+                        // Non-INVITE transactions never reach Accepted per
+                        // RFC 6026 §4. can_transition() should have already
+                        // rejected this; treat as a programming error.
+                        return Err(Error::TransactionError(
+                            format!(
+                                "Accepted state is INVITE-only (transaction type was {})",
+                                self.transaction_type
+                            ),
+                            self.key.clone(),
+                        ));
+                    }
+                }
+            }
+            TransactionState::Completed => {
+                self.timer_a.take().map(|id| -> Option<TransactionTimer> {
+                    self.endpoint_inner.timers.cancel(id)
+                });
+                self.timer_b.take().map(|id| -> Option<TransactionTimer> {
+                    self.endpoint_inner.timers.cancel(id)
+                });
+                self.timer_c.take().map(|id| -> Option<TransactionTimer> {
+                    self.endpoint_inner.timers.cancel(id)
+                });
 
                 if self.transaction_type == TransactionType::ServerInvite {
-                    // start Timer G for server invite only
+                    // start Timer G for server invite only. Completed only
+                    // carries non-2xx finals (2xx route to Accepted), so
+                    // Timer G retransmits on unreliable transports only
+                    // (RFC 3261 §17.2.1); reliable transports need no
+                    // response retransmission.
                     let connection = self.connection.as_ref().ok_or(Error::TransactionError(
                         "no connection found".to_string(),
                         self.key.clone(),
                     ))?;
-                    // RFC 3261 §13.3.1.4: the UAS core retransmits a 2xx on
-                    // every transport, reliable ones included (it can be lost
-                    // at a later UDP hop), until the ACK or 64*T1. A non-2xx
-                    // final is retransmitted on unreliable transports only
-                    // (§17.2.1).
-                    let answered_2xx = self
-                        .last_response
-                        .as_ref()
-                        .is_some_and(|r| r.status_code.kind() == StatusCodeKind::Successful);
-                    if answered_2xx || !connection.is_reliable() {
+                    if !connection.is_reliable() {
                         let timer_g = self.endpoint_inner.timers.timeout(
                             self.endpoint_inner.option.t1,
                             TransactionTimer::TimerG(
@@ -1153,18 +1527,12 @@ impl Transaction {
                     debug!(key=%self.key, last = self.last_response.is_none(), "entered confirmed state, waiting for ACK");
                     if let Some(ref resp) = self.last_response {
                         let dialog_id = DialogId::try_from((resp, TransactionRole::Server))?;
-                        if let Ok(seq) = self.original.cseq_header().and_then(|c| c.seq()) {
-                            self.endpoint_inner
-                                .waiting_ack_cseq
-                                .insert((dialog_id.clone(), seq), self.key.clone());
-                        }
                         self.endpoint_inner
                             .waiting_ack
                             .insert(dialog_id, self.key.clone());
                     }
-                    // Wait for the ACK until Timer D (64*T1): Timer H for a
-                    // non-2xx (RFC 3261 §17.2.1), the 2xx retransmission limit
-                    // for a 2xx (§13.3.1.4). Timer G keeps retransmitting.
+                    // Wait for the ACK until Timer D (64*T1) — Timer H for a
+                    // non-2xx (RFC 3261 §17.2.1). Timer G keeps retransmitting.
                 }
                 // start Timer D
                 let timer_d = self.endpoint_inner.timers.timeout(
@@ -1179,12 +1547,11 @@ impl Transaction {
                 if self.transaction_type == TransactionType::ServerInvite {
                     if let Some(ref resp) = self.last_response {
                         if let Ok(dialog_id) = DialogId::try_from((resp, self.role())) {
-                            // Only our own entries: a later re-INVITE on this
-                            // dialog may have replaced it in `waiting_ack`.
-                            self.endpoint_inner
-                                .waiting_ack
-                                .remove_if(&dialog_id, |_, v| v == &self.key);
-                            self.remove_waiting_ack_cseq(dialog_id);
+                            self.endpoint_inner.forget_waiting_ack(
+                                dialog_id,
+                                &self.original,
+                                &self.key,
+                            );
                         }
                     }
                 }
@@ -1211,45 +1578,56 @@ impl Transaction {
         Ok(self.state.clone())
     }
 
-    fn remove_waiting_ack_cseq(&self, dialog_id: DialogId) {
-        if let Ok(seq) = self.original.cseq_header().and_then(|c| c.seq()) {
-            self.endpoint_inner
-                .waiting_ack_cseq
-                .remove_if(&(dialog_id, seq), |_, v| v == &self.key);
-        }
-    }
-
     fn cleanup_timer(&mut self) {
         self.timer_a
             .take()
-            .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+            .map(|id| -> Option<TransactionTimer> { self.endpoint_inner.timers.cancel(id) });
         self.timer_b
             .take()
-            .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+            .map(|id| -> Option<TransactionTimer> { self.endpoint_inner.timers.cancel(id) });
         self.timer_c
             .take()
-            .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+            .map(|id| -> Option<TransactionTimer> { self.endpoint_inner.timers.cancel(id) });
         self.timer_d
             .take()
-            .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+            .map(|id| -> Option<TransactionTimer> { self.endpoint_inner.timers.cancel(id) });
         self.timer_k
             .take()
-            .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+            .map(|id| -> Option<TransactionTimer> { self.endpoint_inner.timers.cancel(id) });
         self.timer_g
             .take()
-            .map(|id| -> Option<TransactionTimer> {
-                self.endpoint_inner.timers.cancel(id)
-            });
+            .map(|id| -> Option<TransactionTimer> { self.endpoint_inner.timers.cancel(id) });
+        self.timer_l
+            .take()
+            .map(|id| -> Option<TransactionTimer> { self.endpoint_inner.timers.cancel(id) });
+        self.timer_m
+            .take()
+            .map(|id| -> Option<TransactionTimer> { self.endpoint_inner.timers.cancel(id) });
+    }
+
+    /// Whether the cached ACK acknowledges the response currently stored in
+    /// `last_response`: true when the tags match (a retransmission) — a
+    /// different tag means a forked 2xx that needs its own ACK.
+    fn cached_ack_matches_response(ack: &Request, resp: Option<&Response>) -> bool {
+        let Some(resp) = resp else {
+            return true;
+        };
+        let ack_tag = ack
+            .to_header()
+            .ok()
+            .and_then(|h| h.tag().ok())
+            .flatten()
+            .map(|t| t.value().to_string());
+        let resp_tag = resp
+            .to_header()
+            .ok()
+            .and_then(|h| h.tag().ok())
+            .flatten()
+            .map(|t| t.value().to_string());
+        match (ack_tag, resp_tag) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
     }
 
     pub fn role(&self) -> TransactionRole {
@@ -1275,19 +1653,14 @@ impl Transaction {
             matches!(self.transaction_type, TransactionType::ServerInvite)
                 && self.state == TransactionState::Completed;
         if !is_server_invite_waiting_ack {
-            match self.last_response {
-                Some(ref resp) => match DialogId::try_from((resp, self.role())) {
-                    Ok(dialog_id) => {
-                        self.remove_waiting_ack_cseq(dialog_id.clone());
-                        self.endpoint_inner
-                            .waiting_ack
-                            .remove_if(&dialog_id, |_, v| v == &self.key)
-                            .map(|_| ())
-                    }
-                    Err(_) => None,
-                },
-                _ => None,
-            };
+            if let Some(Ok(dialog_id)) = self
+                .last_response
+                .as_ref()
+                .map(|resp| DialogId::try_from((resp, self.role())))
+            {
+                self.endpoint_inner
+                    .forget_waiting_ack(dialog_id, &self.original, &self.key);
+            }
         }
 
         let last_message = {
@@ -1301,8 +1674,17 @@ impl Transaction {
                     ) && self.last_ack.is_none()
                     {
                         if let Some(ref resp) = self.last_response {
-                            if let Ok(ack) = self.endpoint_inner.make_ack(&self.original, resp) {
-                                self.last_ack.replace(ack);
+                            // auto_ack_2xx = false (proxy mode): store no ACK
+                            // for a 2xx, so retransmitted 2xx fall through
+                            // to the TU instead of being absorbed or re-ACKed
+                            // here (RFC 3261 section 17.1.1.2).
+                            let auto_ack = self.endpoint_inner.option.auto_ack_2xx
+                                || resp.status_code.kind() != StatusCodeKind::Successful;
+                            if auto_ack {
+                                if let Ok(ack) = self.endpoint_inner.make_ack(&self.original, resp)
+                                {
+                                    self.last_ack.replace(ack);
+                                }
                             }
                         }
                     }

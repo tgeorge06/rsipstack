@@ -1,10 +1,10 @@
-use crate::prelude::*;
 use super::{
     authenticate::Credential,
     dialog::{DialogInner, DialogStateSender},
     dialog_layer::DialogLayer,
     invite_dialog::InviteDialog,
 };
+use crate::prelude::*;
 use crate::sip::{
     prelude::{HeadersExt, ToTypedHeader},
     uri::ParamsExt,
@@ -113,6 +113,7 @@ use tracing::{debug, info, warn};
 ///     username: "alice".to_string(),
 ///     password: "secret123".to_string(),
 ///     realm: Some("example.com".to_string()),
+///     auth_username: None,
 /// };
 ///
 /// let invite_option = InviteOption {
@@ -199,85 +200,84 @@ impl DialogGuardForUnconfirmed<'_> {
     /// the INVITE transaction, so a 2xx crossing its CANCEL would be ACKed
     /// by the transaction and never BYE'd. Keep the transaction and watch it
     /// (up to 64*T1) for a 2xx to BYE. No second CANCEL is sent: the owner
-    /// sends it. A CANCEL cannot be sent before a provisional response, so
-    /// while the dialog is still `Calling` the owner's hangup sent nothing:
-    /// the dialog is then abandoned as if it were still in the layer.
-    fn watch_taken_dialog(&mut self) {
-        if self.finished {
-            return;
-        }
-        let client_dialog = self.dialog.clone();
+    /// sent it.
+    fn watch_taken_dialog(&mut self, client_dialog: InviteDialog) {
         let Some(mut invite_tx) = self.invite_tx.take() else {
             return;
         };
-        match client_dialog.state() {
-            DialogState::Calling(_) => {
-                debug!(id = %client_dialog.id(), "taken dialog dropped before provisional response");
-                let _ = client_dialog.inner.transition(DialogState::Terminated(
-                    client_dialog.id(),
-                    TerminatedReason::UacCancel,
-                ));
-                crate::platform::spawn(abandon_before_provisional(client_dialog, invite_tx));
-            }
-            DialogState::Trying(_) | DialogState::Early(_, _) => {
-                debug!(id = %client_dialog.id(), "taken dialog dropped mid-INVITE, watching for a 2xx");
-                crate::platform::spawn(async move {
-                    invite_tx.stop_retransmissions();
-                    let deadline =
-                        crate::platform::Instant::now() + invite_tx.endpoint_inner.option.t1x64;
-                    let final_response = wait_final_response(&mut invite_tx, deadline).await;
-                    drop(invite_tx);
-                    bye_if_2xx_after_cancel(&client_dialog, final_response).await;
-                });
-            }
-            _ => {}
-        }
+        debug!(id = %client_dialog.id(), "taken dialog dropped mid-INVITE, watching for a 2xx");
+        crate::platform::spawn(async move {
+            invite_tx.stop_retransmissions();
+            let window = invite_tx.endpoint_inner.option.t1x64;
+            let final_response = wait_response(&mut invite_tx, window, true).await;
+            drop(invite_tx);
+            bye_if_2xx(&client_dialog, final_response).await;
+        });
     }
 }
 
 impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
     fn drop(&mut self) {
-        let Some(dlg) = self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) else {
-            self.watch_taken_dialog();
-            return;
-        };
-
-        let Dialog::Invite(client_dialog) = dlg else {
-            return;
+        let client_dialog = match self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) {
+            Some(Dialog::Invite(client_dialog)) => client_dialog,
+            Some(_) => return,
+            // Another owner took the dialog out of the layer to end it.
+            None => {
+                if self.finished {
+                    return;
+                }
+                let client_dialog = self.dialog.clone();
+                match client_dialog.state() {
+                    // The owner's hangup sent nothing (no CANCEL before a
+                    // provisional response): abandon the INVITE as if the
+                    // dialog were still in the layer.
+                    DialogState::Calling(_) => client_dialog,
+                    DialogState::Trying(_) | DialogState::Early(_, _) => {
+                        self.watch_taken_dialog(client_dialog);
+                        return;
+                    }
+                    _ => return,
+                }
+            }
         };
 
         match client_dialog.state() {
-            // CANCEL cannot be sent before a provisional response (RFC 3261
-            // §9.1). The INVITE stops retransmitting; if the callee got it,
-            // wait for its first response and CANCEL on a provisional, or
-            // ACK and BYE a 2xx.
-            DialogState::Calling(_) => {
-                let invite_tx = self.invite_tx.take();
-                let _ = client_dialog.inner.transition(DialogState::Terminated(
-                    client_dialog.id(),
-                    TerminatedReason::UacCancel,
-                ));
-                debug!(id = %client_dialog.id(), "dialog terminated before provisional response");
-                let Some(invite_tx) = invite_tx else {
-                    return;
-                };
-                let _handle =
-                    crate::platform::spawn(abandon_before_provisional(client_dialog, invite_tx));
-            }
             DialogState::Terminated(_, _) => {}
-            DialogState::Trying(_) | DialogState::Early(_, _) => {
-                let Some(mut invite_tx) = self.invite_tx.take() else {
+            state @ (DialogState::Calling(_)
+            | DialogState::Trying(_)
+            | DialogState::Early(_, _)) => {
+                // CANCEL cannot be sent before a provisional response (RFC 3261
+                // §9.1): a Calling dialog ends now, its INVITE is CANCELed once
+                // a provisional arrives.
+                let calling = matches!(state, DialogState::Calling(_));
+                let invite_tx = self.invite_tx.take();
+                if calling || invite_tx.is_none() {
                     let _ = client_dialog.inner.transition(DialogState::Terminated(
                         client_dialog.id(),
                         TerminatedReason::UacCancel,
                     ));
+                }
+                let Some(mut invite_tx) = invite_tx else {
                     return;
                 };
 
                 debug!(%self.id, "unconfirmed dialog dropped, cancelling it");
                 let _handle = crate::platform::spawn(async move {
-                    let deadline =
-                        crate::platform::Instant::now() + invite_tx.endpoint_inner.option.t1x64;
+                    if calling {
+                        invite_tx.stop_retransmissions();
+                        let window = invite_tx.endpoint_inner.option.t1x64;
+                        let first = wait_response(&mut invite_tx, window, false).await;
+                        if !first
+                            .as_ref()
+                            .is_some_and(|r| r.status_code.kind() == StatusCodeKind::Provisional)
+                        {
+                            drop(invite_tx);
+                            bye_if_2xx(&client_dialog, first).await;
+                            return;
+                        }
+                    }
+                    let started = crate::platform::Instant::now();
+                    let final_window = invite_tx.endpoint_inner.option.t1x64;
                     let mut timeout =
                         core::pin::pin!(crate::platform::sleep(core::time::Duration::from_secs(2)));
                     invite_tx.stop_retransmissions();
@@ -285,12 +285,12 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
                     let mut cancel_done = false;
                     let mut final_response = None;
                     // Boxed so it can be dropped before the wait below.
-                    let mut cancel = Box::pin(client_dialog.cancel());
+                    let mut cancel = Box::pin(client_dialog.send_cancel());
 
                     use crate::platform::select::Which3;
                     loop {
                         // after cancel completes, use pending as placeholder (3-arm race with
-// unchanged types)
+                        // unchanged types)
                         let cancel_sel = if cancel_done {
                             futures::future::Either::Left(core::future::pending::<
                                 core::result::Result<(), crate::Error>,
@@ -317,8 +317,7 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
                             },
                             Which3::C(msg) => match msg {
                                 Some(SipMessage::Response(resp))
-                                    if resp.status_code.kind()
-                                        != StatusCodeKind::Provisional =>
+                                    if resp.status_code.kind() != StatusCodeKind::Provisional =>
                                 {
                                     debug!(
                                         id = %client_dialog.id(),
@@ -335,21 +334,32 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
                     }
 
                     drop(cancel);
-                    let _ = client_dialog.inner.transition(DialogState::Terminated(
-                        client_dialog.id(),
-                        TerminatedReason::UacCancel,
-                    ));
-                    debug!(id = %client_dialog.id(), "dialog terminated");
+                    if !calling {
+                        let _ = client_dialog.inner.transition(DialogState::Terminated(
+                            client_dialog.id(),
+                            TerminatedReason::UacCancel,
+                        ));
+                        debug!(id = %client_dialog.id(), "dialog terminated");
+                    }
 
                     // The callee may still answer after the CANCEL: keep the
                     // INVITE transaction until its final response (up to
                     // 64*T1) so a 2xx is ACKed, then end that session with a
                     // BYE (RFC 3261 §9.1, §15).
                     if final_response.is_none() {
-                        final_response = wait_final_response(&mut invite_tx, deadline).await;
+                        let elapsed = crate::platform::Instant::now()
+                            .checked_duration_since(started)
+                            .unwrap_or_default();
+                        final_response = wait_response(
+                            &mut invite_tx,
+                            final_window.saturating_sub(elapsed),
+                            true,
+                        )
+                        .await;
                     }
+                    // Closing the command channel terminates the dialog loop.
                     drop(invite_tx);
-                    bye_if_2xx_after_cancel(&client_dialog, final_response).await;
+                    bye_if_2xx(&client_dialog, final_response).await;
                 });
             }
             DialogState::Confirmed(_, _) => {
@@ -364,103 +374,34 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
     }
 }
 
-/// Abandon an INVITE that has had no response yet. CANCEL cannot be sent
-/// before a provisional response (RFC 3261 §9.1): the INVITE stops
-/// retransmitting; if the callee got it, wait for its first response and
-/// CANCEL on a provisional, or ACK and BYE a 2xx.
-async fn abandon_before_provisional(client_dialog: InviteDialog, mut invite_tx: Transaction) {
-    invite_tx.stop_retransmissions();
-    let t1x64 = invite_tx.endpoint_inner.option.t1x64;
-    let deadline = crate::platform::Instant::now() + t1x64;
-    let final_response = match wait_response(&mut invite_tx, deadline).await {
-        Some(resp) if resp.status_code.kind() == StatusCodeKind::Provisional => {
-            // A fresh window for the CANCEL and the final response.
-            let deadline = crate::platform::Instant::now() + t1x64;
-            let mut cancel = core::pin::pin!(client_dialog.send_cancel());
-            let mut cancel_done = false;
-            let mut final_wait = core::pin::pin!(wait_final_response(&mut invite_tx, deadline));
-            loop {
-                // Once the CANCEL is done, race the final response alone.
-                let cancel_sel = if cancel_done {
-                    futures::future::Either::Left(core::future::pending())
-                } else {
-                    futures::future::Either::Right(&mut cancel)
-                };
-                let mut cancel_sel = core::pin::pin!(cancel_sel);
-                match crate::platform::select::select2(&mut cancel_sel, &mut final_wait).await {
-                    crate::platform::select::Either::A(result) => {
-                        cancel_done = true;
-                        if let Err(e) = result {
-                            warn!(id = %client_dialog.id(), error = %e, "dialog cancel failed");
-                        }
-                    }
-                    crate::platform::select::Either::B(resp) => break resp,
-                }
-            }
-        }
-        other => other,
-    };
-    drop(invite_tx);
-    bye_if_2xx_after_cancel(&client_dialog, final_response).await;
-}
-
-/// End the session a 2xx to an abandoned INVITE established.
-async fn bye_if_2xx_after_cancel(client_dialog: &InviteDialog, final_response: Option<Response>) {
-    let Some(resp) = final_response else {
-        return;
-    };
-    if resp.status_code.kind() != StatusCodeKind::Successful {
-        return;
-    }
-    info!(id = %client_dialog.id(), "2xx after CANCEL, sending BYE");
-    if let Err(e) = client_dialog.bye_2xx_after_cancel(&resp).await {
-        warn!(id = %client_dialog.id(), error = %e, "BYE after CANCEL failed");
-    }
-}
-
-/// Wait until `deadline` for the INVITE transaction's first response.
+/// Wait up to `limit` for the INVITE transaction's first response, or its
+/// first final one.
 async fn wait_response(
     invite_tx: &mut Transaction,
-    deadline: crate::platform::Instant,
+    limit: core::time::Duration,
+    final_only: bool,
 ) -> Option<Response> {
     let wait = async {
         while let Some(msg) = invite_tx.receive().await {
             if let SipMessage::Response(resp) = msg {
-                return Some(resp);
-            }
-        }
-        None
-    };
-    timeout_at(deadline, wait).await
-}
-
-/// Wait until `deadline` for the INVITE transaction's final response.
-async fn wait_final_response(
-    invite_tx: &mut Transaction,
-    deadline: crate::platform::Instant,
-) -> Option<Response> {
-    let wait = async {
-        while let Some(msg) = invite_tx.receive().await {
-            if let SipMessage::Response(resp) = msg {
-                if resp.status_code.kind() != StatusCodeKind::Provisional {
+                if !final_only || resp.status_code.kind() != StatusCodeKind::Provisional {
                     return Some(resp);
                 }
             }
         }
         None
     };
-    timeout_at(deadline, wait).await
+    crate::platform::timeout(limit, wait).await.ok().flatten()
 }
 
-/// Run `wait` until `deadline`; `None` once the deadline has passed.
-async fn timeout_at<T>(
-    deadline: crate::platform::Instant,
-    wait: impl core::future::Future<Output = Option<T>>,
-) -> Option<T> {
-    let limit = deadline
-        .checked_duration_since(crate::platform::Instant::now())
-        .unwrap_or_default();
-    crate::platform::timeout(limit, wait).await.ok().flatten()
+/// End the session a 2xx to an abandoned INVITE established.
+async fn bye_if_2xx(client_dialog: &InviteDialog, resp: Option<Response>) {
+    if let Some(resp) = resp.filter(|r| r.status_code.kind() == StatusCodeKind::Successful) {
+        info!(id = %client_dialog.id(), "2xx after CANCEL, sending BYE");
+        if let Err(e) = client_dialog.bye_2xx_after_cancel(&resp).await {
+            warn!(id = %client_dialog.id(), error = %e, "BYE after CANCEL failed");
+        }
+    }
 }
 
 pub type InviteAsyncResult = Result<(DialogId, Option<Response>)>;
@@ -815,6 +756,19 @@ impl DialogLayer {
                         self.inner
                             .dialogs
                             .insert(new_dialog_id.to_string(), Dialog::Invite(dialog.clone()));
+
+                        // RFC 6026 §7.2: the client transaction is in Accepted
+                        // with Timer M (64*T1) armed. Keep receiving until it
+                        // ends so retransmitted 2xx keep being re-ACKed and
+                        // forked 2xx are observed; abandoning the transaction
+                        // here would leave it (and its timers) in the
+                        // endpoint's table and silently stop the re-ACKs.
+                        if let Some(mut tx) = guard.invite_tx.take() {
+                            crate::platform::spawn(async move {
+                                while tx.receive().await.is_some() {}
+                                debug!(id = %new_dialog_id, "accepted transaction drained (Timer M expired)");
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -880,6 +834,16 @@ impl DialogLayer {
                         inner
                             .dialogs
                             .insert(new_id.to_string(), Dialog::Invite(dialog_clone.clone()));
+
+                        // RFC 6026 §7.2: keep draining the Accepted transaction
+                        // until Timer M ends it (re-ACKs retransmitted 2xx,
+                        // observes forked 2xx, and detaches it from the
+                        // endpoint's table). See do_invite for the rationale.
+                        let confirmed_id = new_id.clone();
+                        crate::platform::spawn(async move {
+                            while tx.receive().await.is_some() {}
+                            debug!(id = %confirmed_id, "accepted transaction drained (Timer M expired)");
+                        });
                     }
                 }
                 Err(e) => debug!(%id0, error = %e, "async invite failed"),

@@ -1,6 +1,6 @@
 [package]
 name = "rsipstack"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "SIP Stack Rust library for building SIP applications"
 license = "MIT"
@@ -98,7 +98,9 @@ http = "1.4.0"
 [[example]]
 name = "client"
 path = "examples/client/main.rs"
+required-features = ["bench"]
 
 [[example]]
 name = "proxy"
 path = "examples/proxy.rs"
+required-features = ["bench"]

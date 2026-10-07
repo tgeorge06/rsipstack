@@ -150,9 +150,12 @@ async fn test_request_after_peer_closed_stream_uses_new_connection() -> Result<(
         let first_connection = tx.connection.clone().expect("first connection");
         drop(tx);
 
-        // Wait for the transport layer to see the peer's FIN.
+        // The transport layer sees the peer's FIN and marks the flow
+        // terminated, so flow affinity (RFC 5626) no longer picks it.
         let token = first_connection.cancel_token().expect("stream token");
-        let _ = tokio::time::timeout(Duration::from_secs(1), token.cancelled()).await;
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .expect("a flow the peer closed must be marked terminated");
 
         let req = make_options(peer, 2)?;
         let key = TransactionKey::from_request(&req, TransactionRole::Client)?;
@@ -196,7 +199,9 @@ async fn test_send_failure_on_stream_is_reported_at_once() -> Result<()> {
         let target = SipAddr::try_from(&crate::sip::Uri::try_from(
             format!("sip:{};transport=tcp", peer).as_str(),
         )?)?;
-        let dead = SipConnection::Tcp(TcpConnection::connect(&target, None).await?);
+        let dead_token = CancellationToken::new();
+        let dead =
+            SipConnection::Tcp(TcpConnection::connect(&target, Some(dead_token.clone())).await?);
         // A flow whose local side is already shut down: every write fails.
         dead.close().await.ok();
 
@@ -222,6 +227,10 @@ async fn test_send_failure_on_stream_is_reported_at_once() -> Result<()> {
             Some(StatusCode::ServiceUnavailable),
             "a failed {method} write on a stream connection must be reported to the TU, \
              not left to time out"
+        );
+        assert!(
+            dead_token.is_cancelled(),
+            "the connection whose {method} write failed must be retired"
         );
         let resp = resp.unwrap();
         assert!(

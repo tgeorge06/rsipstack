@@ -11,17 +11,17 @@
 //! [`ServerInviteDialog`]: crate::dialog::server_dialog::ServerInviteDialog
 //! [`ClientInviteDialog`]: crate::dialog::client_dialog::ClientInviteDialog
 
-use crate::prelude::*;
 use super::dialog::{Dialog, DialogInnerRef, DialogState, TerminatedReason, TransactionHandle};
 use super::subscription::{ClientSubscriptionDialog, ServerSubscriptionDialog};
 use super::DialogId;
+use crate::platform::CancellationToken;
+use crate::prelude::*;
 use crate::sip::prelude::{HasHeaders, HeadersExt};
 use crate::sip::{Header, Method, Request, Response, SipMessage, StatusCode, StatusCodeKind};
 use crate::transaction::key::TransactionRole;
 use crate::transaction::transaction::{Transaction, TransactionEvent};
 use crate::Result;
 use core::sync::atomic::Ordering;
-use crate::platform::CancellationToken;
 use tracing::{debug, trace, warn};
 
 /// Unified INVITE dialog that can act as either a UAS (Server) or UAC (Client).
@@ -61,14 +61,17 @@ impl InviteDialog {
     }
 
     /// The most recent ACK received for an INVITE or re-INVITE this dialog
-    /// answered, or `None` if none has been received yet.
+    /// answered (the whole request, headers and body), or `None` if none has
+    /// been received since the dialog was created or restored.
     ///
     /// When the INVITE or re-INVITE carried no offer, the offer goes in the
     /// 2xx and the answer comes back in the ACK body (RFC 3261 §13.2.1,
-    /// §14.2). The ACK is recorded before the `Confirmed` state it causes is
-    /// notified. `Confirmed` is also notified after other mid-dialog
-    /// requests, so match the ACK's CSeq against the INVITE it should
-    /// acknowledge.
+    /// §14.2). The ACK is recorded when the INVITE transaction delivers it,
+    /// before the `Confirmed` state it causes is notified. Each such ACK
+    /// replaces the previous one; a new re-INVITE does not clear it, so until
+    /// its ACK arrives this still returns the previous one. `Confirmed` is
+    /// also notified after other mid-dialog requests: match the ACK's CSeq
+    /// number against the INVITE it should acknowledge.
     pub fn last_remote_ack(&self) -> Option<Request> {
         self.inner.remote_ack.lock().clone()
     }
@@ -84,16 +87,6 @@ impl InviteDialog {
     /// or `None` if none was sent yet.
     pub fn last_sent_ack(&self) -> Option<Request> {
         self.inner.last_sent_ack.lock().clone()
-    }
-
-    /// How the most recent re-INVITE this dialog answered ended (see
-    /// [`ReinviteAck`](super::dialog::ReinviteAck)). Taken once; `None` when
-    /// nothing is pending. Read `Received` on the `Confirmed` state that
-    /// follows the re-INVITE (match its CSeq against the `Confirmed`
-    /// response's), and `TimedOut` on `Terminated(Timeout)`. A `TimedOut`
-    /// is final: no later re-INVITE outcome replaces it.
-    pub fn take_reinvite_ack(&self) -> Option<super::dialog::ReinviteAck> {
-        self.inner.reinvite_ack.lock().take()
     }
 
     /// The initial INVITE request that created this dialog.
@@ -861,7 +854,33 @@ impl InviteDialog {
             .transition(DialogState::Updated(self.id(), tx.original.clone(), handle))?;
 
         self.inner.process_transaction_handle(tx, rx).await?;
-        self.inner.await_reinvite_ack(tx).await
+        let answered_2xx = tx
+            .last_response
+            .as_ref()
+            .is_some_and(|resp| resp.status_code.kind() == StatusCodeKind::Successful);
+        let mut acked = false;
+
+        while let Some(msg) = tx.receive().await {
+            if let SipMessage::Request(req) = msg {
+                if req.method == Method::Ack {
+                    debug!(id = %self.id(), "received ack for re-invite {}", req.uri);
+                    self.inner.remote_ack.lock().replace(req);
+                    self.inner.transition(DialogState::Confirmed(
+                        self.id(),
+                        tx.last_response.clone().unwrap_or_default(),
+                    ))?;
+                    acked = true;
+                    break;
+                }
+            }
+        }
+        // A matching ACK ends the Accepted transaction; `acked` keeps the
+        // timeout path (no ACK within 64*T1) from firing on a confirmed
+        // re-INVITE.
+        self.inner
+            .end_session_without_ack(tx, answered_2xx && !acked)
+            .await;
+        Ok(())
     }
 
     async fn handle_invite(&mut self, tx: &mut Transaction) -> Result<()> {

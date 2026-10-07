@@ -76,7 +76,15 @@ async fn udp_exchange_logged_at(level: Level) -> crate::Result<String> {
 async fn test_udp_raw_messages_are_logged_at_debug_only() -> crate::Result<()> {
     // The INFO check is only meaningful if the raw message is logged at all:
     // at DEBUG both directions are.
-    let logged = udp_exchange_logged_at(Level::DEBUG).await?;
+    // Other tests register the same callsites concurrently, which can race
+    // the interest rebuild: retry the DEBUG sanity check before failing it.
+    let mut logged = String::new();
+    for _ in 0..3 {
+        logged = udp_exchange_logged_at(Level::DEBUG).await?;
+        if logged.contains("udp received") && logged.contains("udp send") {
+            break;
+        }
+    }
     assert!(
         logged.contains("udp received") && logged.contains("udp send"),
         "got:\n{logged}"

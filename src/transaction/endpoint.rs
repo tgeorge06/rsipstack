@@ -1,4 +1,3 @@
-use crate::prelude::*;
 use super::{
     key::TransactionKey,
     make_via_branch,
@@ -6,6 +5,11 @@ use super::{
     transaction::{Transaction, TransactionEvent, TransactionEventSender},
     CallIdFormat, SipConnection, TransactionReceiver, TransactionSender, TransactionTimer,
 };
+use crate::platform::mpsc::{error, unbounded_channel};
+use crate::platform::sync::Mutex;
+use crate::platform::sync::RwMap;
+use crate::platform::CancellationToken;
+use crate::prelude::*;
 use crate::sip::{prelude::HeadersExt, SipMessage};
 use crate::{
     dialog::DialogId,
@@ -13,10 +17,6 @@ use crate::{
     Error, Result, VERSION,
 };
 use async_trait::async_trait;
-use crate::platform::sync::RwMap;
-use crate::platform::sync::Mutex;
-use crate::platform::mpsc::{error, unbounded_channel};
-use crate::platform::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 pub trait MessageInspector: Send + Sync {
@@ -49,6 +49,13 @@ pub struct EndpointOption {
     /// (RFC 7989) needs no switch: dialogs participate only when the
     /// application supplies a UUID or the peer sends a Session-ID header.
     pub history_info_enabled: bool,
+    /// Whether a client INVITE transaction ACKs a 2xx final itself (default `true`).
+    /// With `false` a 2xx moves the transaction straight to
+    /// Terminated: no automatic ACK, no stored ACK.
+    /// RFC 3261 section 17.1.1.2: the 2xx ACK is the TU's, end-to-end;
+    /// proxies (section 16) must not ACK a 2xx and must see retransmitted 2xx.
+    /// `true` keeps the UA behavior the dialog layer relies on.
+    pub auto_ack_2xx: bool,
 }
 
 impl Default for EndpointOption {
@@ -62,6 +69,7 @@ impl Default for EndpointOption {
             callid_suffix: None,
             callid_format: CallIdFormat::default(),
             history_info_enabled: false,
+            auto_ack_2xx: true,
         }
     }
 }
@@ -113,9 +121,8 @@ pub struct EndpointInner {
     pub transactions: RwMap<TransactionKey, TransactionEventSender>,
     pub waiting_ack: RwMap<DialogId, TransactionKey>,
     /// Server INVITE transactions waiting for the ACK of their 2xx, by dialog
-    /// and INVITE CSeq number. `waiting_ack` holds only the latest INVITE of a
-    /// dialog; the ACK of an earlier re-INVITE can arrive after the next one
-    /// (RFC 3261 §13.2.2.4: the ACK carries the CSeq number of its INVITE).
+    /// and INVITE CSeq number: `waiting_ack` holds only a dialog's latest
+    /// INVITE, and the ACK of an earlier one can arrive after it (§13.2.2.4).
     pub(crate) waiting_ack_cseq: RwMap<(DialogId, u32), TransactionKey>,
     incoming_sender: TransactionSender,
     incoming_receiver: Mutex<Option<TransactionReceiver>>,
@@ -236,7 +243,7 @@ impl EndpointInner {
             transactions: RwMap::<TransactionKey, TransactionEventSender>::new(),
             finished_transactions: RwMap::<TransactionKey, Option<SipMessage>>::new(),
             waiting_ack: RwMap::<DialogId, TransactionKey>::new(),
-            waiting_ack_cseq: RwMap::<(DialogId, u32), TransactionKey>::new(),
+            waiting_ack_cseq: RwMap::new(),
             timer_interval: timer_interval.unwrap_or(Duration::from_millis(20)),
             cancel_token,
             incoming_sender,
@@ -269,6 +276,7 @@ impl EndpointInner {
     async fn process_transport_layer(self: Arc<Self>) -> Result<()> {
         self.transport_layer.serve_listens().await.ok();
 
+        #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
         let mut transport_rx = match self.transport_layer.inner.transport_rx.lock().take() {
             Some(rx) => rx,
             None => {
@@ -377,24 +385,18 @@ impl EndpointInner {
                     if let Ok(dialog_id) =
                         DialogId::try_from((req, super::key::TransactionRole::Server))
                     {
-                        // Route by dialog AND CSeq number, so the ACK of an
-                        // earlier re-INVITE reaches its own transaction and is
-                        // never taken for the ACK of a later one.
-                        let ack_cseq = req.cseq_header()?.seq()?;
-                        if let Some(tx_key) = self
-                            .waiting_ack_cseq
-                            .get(&(dialog_id, ack_cseq))
-                            .map(|v| v.clone())
+                        // By dialog AND CSeq number: a late ACK of an earlier
+                        // re-INVITE must reach its own transaction.
+                        let seq = req.cseq_header().and_then(|c| c.seq()).ok();
+                        if let Some(tx_key) =
+                            seq.and_then(|seq| self.waiting_ack_cseq.get(&(dialog_id, seq)))
                         {
                             key = tx_key;
                         }
                     }
                 }
                 // check is the termination of an existing transaction
-                let last_message = self
-                    .finished_transactions
-                    .get(&key)
-                    .and_then(|v| v.clone());
+                let last_message = self.finished_transactions.get(&key).and_then(|v| v.clone());
 
                 if let Some(last_message) = last_message {
                     // ACK for a completed ServerInvite transaction: absorb it silently
@@ -403,8 +405,7 @@ impl EndpointInner {
                         if let Ok(dialog_id) =
                             DialogId::try_from((req, super::key::TransactionRole::Server))
                         {
-                            self.waiting_ack.remove_if(&dialog_id, |_, v| v == &key);
-                            self.waiting_ack_cseq.retain(|_, v| v != &key);
+                            self.forget_waiting_ack(dialog_id, req, &key);
                         }
                         return Ok(());
                     }
@@ -623,6 +624,28 @@ impl EndpointInner {
             params,
         };
         Ok(via)
+    }
+
+    /// Drop `key`'s ACK routes for `dialog_id`, never another transaction's.
+    pub(crate) fn forget_waiting_ack(
+        &self,
+        dialog_id: DialogId,
+        req: &crate::sip::Request,
+        key: &TransactionKey,
+    ) {
+        if let Ok(seq) = req.cseq_header().and_then(|c| c.seq()) {
+            let route = (dialog_id.clone(), seq);
+            self.waiting_ack_cseq.with_mut(|m| {
+                if m.get(&route) == Some(key) {
+                    m.remove(&route);
+                }
+            });
+        }
+        self.waiting_ack.with_mut(|m| {
+            if m.get(&dialog_id) == Some(key) {
+                m.remove(&dialog_id);
+            }
+        });
     }
 
     pub fn get_running_transactions(&self) -> Option<Vec<TransactionKey>> {
