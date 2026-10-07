@@ -50,6 +50,7 @@ fn create_401_response() -> Response {
     Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::Unauthorized,
         version: crate::sip::Version::V2,
         headers: vec![
@@ -164,6 +165,7 @@ fn create_407_response() -> Response {
     Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::ProxyAuthenticationRequired,
         version: crate::sip::Version::V2,
         headers: vec![

@@ -82,6 +82,7 @@ async fn test_server_transaction() {
         let done_response = crate::sip::Response {
             synthetic: false,
             received_from: None,
+            wire_reason: None,
             status_code: crate::sip::StatusCode::OK,
             version: crate::sip::Version::V2,
             headers,

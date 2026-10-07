@@ -533,6 +533,12 @@ pub struct Response {
     /// Where a response received from the network came from (see
     /// [`ReceivedFrom`]); `None` for a parsed or locally built response.
     pub received_from: Option<ReceivedFrom>,
+    /// The reason phrase a parsed Status-Line carried when it differs from
+    /// the standard text for its code (e.g. `403 Caller Origination Number is
+    /// Invalid`); `None` for the standard phrase, an unknown code (kept in
+    /// [`StatusCode::Other`]) and every locally built response. Never
+    /// serialized: `Display` still writes the standard phrase.
+    pub wire_reason: Option<String>,
     pub status_code: StatusCode,
     pub version: Version,
     pub headers: Headers,
@@ -608,6 +614,7 @@ impl Default for Response {
         Response {
             synthetic: false,
             received_from: None,
+            wire_reason: None,
             status_code: StatusCode::OK,
             version: Version::V2,
             headers: Headers::default(),
