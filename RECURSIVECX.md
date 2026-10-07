@@ -146,6 +146,20 @@ same patches where they apply.
   `@`, then `callid_suffix`. rcx sets it in `proxy/server.rs`.
 - **Test:** `transaction::tests::tests::test_make_call_id_random22`.
 
+### R27: `Confirmed` carries the 2xx its ACK confirms
+
+- **Where:** `Transaction::cleanup`: a server INVITE transaction keeps
+  `last_response` (it still hands a copy to `finished_transactions`).
+- **What:** since 0.7.1 the matching ACK ends an `Accepted` server INVITE
+  transaction (RFC 6026 §7.1, upstream #169) before the dialog reads
+  `tx.last_response` for `DialogState::Confirmed`. Upstream then notifies
+  `Confirmed` with `Response::default()` (no CSeq, no headers), for the
+  initial INVITE and every re-INVITE. rcx correlates `Confirmed` by the
+  response's CSeq (`confirms_initial_invite`, `is_reconfirmation`, the
+  re-offer settle).
+- **Test:** `dialog::tests::test_late_reinvite_ack` (CSeq of each
+  `Confirmed`).
+
 ## Upstream 0.7.1 behavior rcx observes (not fork patches)
 
 - RFC 6026 `Accepted` state. Server: the 2xx is retransmitted by Timer G

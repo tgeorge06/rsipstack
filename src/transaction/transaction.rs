@@ -1690,8 +1690,14 @@ impl Transaction {
                     }
                     self.last_ack.take().map(SipMessage::Request)
                 }
-                TransactionType::ServerNonInvite | TransactionType::ServerInvite => {
+                TransactionType::ServerNonInvite => {
                     self.last_response.take().map(SipMessage::Response)
+                }
+                // Kept on the transaction: the matching ACK ends an Accepted
+                // server INVITE (RFC 6026 §7.1) before the dialog reads the
+                // 2xx it confirms (`DialogState::Confirmed`).
+                TransactionType::ServerInvite => {
+                    self.last_response.clone().map(SipMessage::Response)
                 }
                 _ => None,
             }
