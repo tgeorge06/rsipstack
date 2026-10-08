@@ -115,6 +115,22 @@ pub(super) async fn establish_with_credential(
     });
     let dialog_layer = DialogLayer::new(endpoint.inner.clone());
 
+    // Pump inbound in-dialog requests (e.g. the peer's BYE) into the layer.
+    let mut incoming = endpoint.incoming_transactions()?;
+    let pump_layer = DialogLayer {
+        endpoint: dialog_layer.endpoint.clone(),
+        inner: dialog_layer.inner.clone(),
+    };
+    tokio::spawn(async move {
+        while let Some(mut tx) = incoming.recv().await {
+            if let Some(mut dialog) = pump_layer.match_dialog(&tx) {
+                tokio::spawn(async move {
+                    let _ = dialog.handle(&mut tx).await;
+                });
+            }
+        }
+    });
+
     let (state_sender, mut state_receiver) = unbounded_channel();
     let invite_option = InviteOption {
         caller: Uri::try_from("sip:alice@example.com")?,
@@ -190,12 +206,13 @@ async fn assert_provisional_keeps_confirmed(method: Method) -> crate::Result<()>
         "dialog must be Confirmed after the in-dialog {method} completes, state: {}",
         dialog.state()
     );
-    // The 183 neither changes the dialog's state nor is notified as `Early`:
-    // subscribers read `Early` as the dialog's own early state.
+    // Fork (R19): the 183 is not notified either. Subscribers read `Early`
+    // as the dialog's early state (ringing), not as a provisional to a later
+    // transaction.
     let states = drain_states(&mut states);
     assert!(
         !states.iter().any(|s| matches!(s, DialogState::Early(_, _))),
-        "a 183 to an in-dialog {method} must not be notified as Early, got {states:?}"
+        "a 1xx to an in-dialog {method} must not be notified as Early, got {states:?}"
     );
 
     // The call can still be hung up with a BYE.
@@ -221,4 +238,72 @@ async fn test_reinvite_provisional_keeps_dialog_confirmed() -> crate::Result<()>
 #[tokio::test]
 async fn test_update_provisional_keeps_dialog_confirmed() -> crate::Result<()> {
     assert_provisional_keeps_confirmed(Method::Update).await
+}
+
+/// A provisional response to an in-dialog request is never notified after
+/// the dialog terminated: the peer hangs up while a re-INVITE is pending,
+/// and only then answers it with a 183.
+#[tokio::test]
+async fn test_provisional_after_terminated_is_not_notified() -> crate::Result<()> {
+    let token = CancellationToken::new();
+    let (dialog, mut states, peer) = establish(&token).await?;
+    while states.try_recv().is_ok() {}
+
+    // A re-INVITE goes out and stays pending.
+    let requester = dialog.clone();
+    let pending = tokio::spawn(async move { requester.reinvite(None, None).await });
+    let (req, uac) = recv_request(&peer, Method::Invite).await;
+
+    // The peer hangs up while the re-INVITE is pending.
+    let id = dialog.id();
+    let uac_uri = format!("sip:alice@{uac}");
+    let bye = format!(
+        "BYE {uac_uri} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {peer_addr};branch=z9hG4bK-bye\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:bob@{peer_addr}>;tag={PEER_TAG}\r\n\
+         To: <{uac_uri}>;tag={local}\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: 2 BYE\r\n\
+         Content-Length: 0\r\n\r\n",
+        peer_addr = peer.local_addr()?,
+        local = id.local_tag,
+        call_id = id.call_id,
+    );
+    peer.send_to(bye.as_bytes(), uac).await?;
+    // The dialog terminates and answers the BYE with a 200.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(states.recv().await, Some(DialogState::Terminated(..))) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for Terminated");
+    assert!(dialog.state().is_terminated());
+
+    // Only now does the peer answer the re-INVITE — with a provisional.
+    reply(&peer, uac, &req, 183, "Session Progress").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let after: Vec<String> = drain_states(&mut states)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert!(
+        after.is_empty(),
+        "nothing may be notified after Terminated, got {after:?}"
+    );
+
+    // Finish the pending re-INVITE so the transaction does not linger.
+    reply(&peer, uac, &req, 200, "OK").await;
+    tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("re-INVITE did not complete")
+        .expect("re-INVITE task panicked")?;
+
+    assert!(dialog.state().is_terminated());
+    token.cancel();
+    Ok(())
 }

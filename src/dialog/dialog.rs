@@ -715,7 +715,7 @@ impl DialogInner {
                 warn!(
                     id = self.id.lock().to_string(),
                     destination = tx.destination.as_ref().map(|d| d.to_string()).as_deref(),
-                    method = %tx.original.method,
+                    method = %method,
                     "failed to send request error: {}",
                     e
                 );
@@ -1187,6 +1187,7 @@ impl DialogInner {
             }
         }
         let need_fallback_retry;
+        let mut send_error = None;
         match tx.send().await {
             Ok(_) => {
                 debug!(
@@ -1214,6 +1215,7 @@ impl DialogInner {
                     debug!(id = self.id.lock().to_string(), req = %tx.original, "request that failed to send");
                     return Err(e);
                 }
+                send_error = Some(e);
             }
         }
 
@@ -1285,6 +1287,11 @@ impl DialogInner {
                     method = %method,
                     "no usable connection and no dial-back target; giving up after first send"
                 );
+                // The failed send never started the transaction: no response
+                // or timer will ever end it, so report the error now.
+                if let Some(e) = send_error {
+                    return Err(e);
+                }
             }
         }
 
@@ -1309,9 +1316,9 @@ impl DialogInner {
                         // and never back. A 1xx to a mid-dialog request (re-INVITE,
                         // UPDATE, ...) must not regress an established dialog to
                         // Early, or BYE is refused and hangup() tries to CANCEL.
-                        // Nor is it notified: subscribers treat `Early` as the
-                        // dialog's early state (ringing), not as a provisional
-                        // to a later transaction.
+                        // Nor is it notified (R19, fork-only): subscribers
+                        // treat `Early` as the dialog's early state (ringing),
+                        // not as a provisional to a later transaction.
                         if self.can_cancel() {
                             self.transition(DialogState::Early(self.id.lock().clone(), resp))?;
                         }
@@ -1382,28 +1389,84 @@ impl DialogInner {
         self.send_dialog_request(request).boxed().await
     }
 
-    /// Send the BYE that ends this dialog and notify `Terminated`, with the
-    /// lifecycle subscribers rely on to finish their teardown:
+    /// Send the BYE that ends this dialog. RFC 3261 §15.1.1: the session ends
+    /// once the BYE is handed to its transaction, and a 481, a 408 or no
+    /// response ends the dialog. So whatever the transaction returns, the
+    /// dialog is `Terminated(reason)`; a failure is still returned.
     ///
-    /// * UAS: `Terminated(UasBye)` is notified before the BYE is sent, so it
-    ///   never waits for the BYE's response; the send result is returned.
-    /// * UAC: the BYE transaction runs, then `Terminated(UacBye)` is notified
-    ///   whatever its outcome. A failed send is logged and the dialog still
-    ///   ends locally; `Ok` is returned.
-    pub(super) async fn send_bye(&self, request: Request) -> Result<()> {
+    /// Fork (R24): a UAS notifies `Terminated` before the BYE is sent, so its
+    /// subscribers never wait for the BYE's response. A UAC notifies it after
+    /// the BYE transaction, as upstream does.
+    pub(super) async fn send_bye(&self, request: Request, reason: TerminatedReason) -> Result<()> {
         let id = self.id.lock().clone();
-        match self.role {
-            TransactionRole::Server => {
-                self.transition(DialogState::Terminated(id, TerminatedReason::UasBye))?;
-                self.do_request(request).await.map(|_| ())
-            }
-            TransactionRole::Client => {
-                if let Err(e) = self.do_request(request).await {
-                    info!(%id, error = %e, "bye error, ending the dialog locally");
-                }
-                self.transition(DialogState::Terminated(id, TerminatedReason::UacBye))
-            }
+        if self.role == TransactionRole::Server {
+            self.transition(DialogState::Terminated(id, reason))?;
+            return self.do_request(request).await.map(|_| ());
         }
+        let result = self.do_request(request).await;
+        self.transition(DialogState::Terminated(id, reason))?;
+        result.map(|_| ())
+    }
+
+    /// End a dialog a forked 2xx established (RFC 3261 §13.2.2.4).
+    ///
+    /// Every 2xx to the INVITE with a new To tag creates its own dialog; the
+    /// UAC keeps a single session (the first 2xx's), so the transaction has
+    /// already ACKed the forked 2xx and this sends the BYE that terminates
+    /// the extra branch. The BYE is built from that response's own remote
+    /// target (Contact) and route set (Record-Route); the confirmed dialog's
+    /// state is not touched and no dialog is registered for the branch.
+    pub(super) async fn bye_forked_branch(&self, resp: &Response) -> Result<()> {
+        let contact_uri = resp
+            .typed_contact_headers()?
+            .first()
+            .map(|c| c.uri.clone())
+            .ok_or_else(|| crate::Error::Error("missing Contact header".to_string()))?;
+
+        // §12.2.1.1: the forked dialog's route set is the 2xx's Record-Route.
+        let mut routes: Vec<Route> = resp
+            .record_route_headers()
+            .into_iter()
+            .flat_map(|rr| split_rr_values(rr.value()))
+            .map(Route::from)
+            .collect();
+        routes.reverse();
+
+        // To carries the forked branch's tag, From keeps ours.
+        let to = resp.to_header()?.clone();
+        let id = self.id.lock().clone();
+        let via = self
+            .endpoint_inner
+            .get_via(self.via_addr_for_send_transport(), None)?;
+        let cseq = CSeq {
+            seq: self.increment_local_seq(),
+            method: Method::Bye,
+        };
+
+        let mut headers: Vec<Header> = vec![
+            Header::Via(via.into()),
+            Header::CallId(id.call_id.clone().into()),
+            Header::From(self.from.clone().to_string().into()),
+            Header::To(to),
+            Header::CSeq(cseq.into()),
+            Header::UserAgent(self.endpoint_inner.user_agent.clone().into()),
+        ];
+        if let Some(uri) = self.local_contact.as_ref() {
+            headers.push(Contact::from(uri.clone()).into());
+        }
+        headers.extend(routes.into_iter().map(Header::Route));
+        headers.push(Header::MaxForwards(70.into()));
+
+        debug!(id = %id, uri = %contact_uri, "sending BYE to a forked dialog");
+        self.do_request(crate::sip::Request {
+            method: Method::Bye,
+            uri: contact_uri,
+            headers: headers.into(),
+            body: Vec::new(),
+            version: crate::sip::Version::V2,
+        })
+        .await?;
+        Ok(())
     }
 
     /// RFC 3261 §13.3.1.4: the server transaction of an INVITE or re-INVITE
@@ -1677,7 +1740,6 @@ impl DialogInner {
         Ok(())
     }
 
-    #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
     #[cfg_attr(not(feature = "platform-tokio"), allow(unused_mut))]
     pub async fn process_transaction_handle(
         &self,

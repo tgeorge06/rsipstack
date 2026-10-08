@@ -1238,7 +1238,12 @@ impl Transaction {
                 }
             }
             TransactionState::Proceeding => {
-                if let TransactionTimer::TimerC(_) = timer {
+                // Timer C (client INVITE), or Timer F, run as Timer B, for a
+                // non-INVITE client (RFC 3261 §17.1.2.2).
+                if matches!(timer, TransactionTimer::TimerC(_))
+                    || (matches!(timer, TransactionTimer::TimerB(_))
+                        && self.transaction_type == TransactionType::ClientNonInvite)
+                {
                     // Inform TU about timeout
                     let mut timeout_response = self.endpoint_inner.make_response(
                         &self.original,
@@ -1693,9 +1698,9 @@ impl Transaction {
                 TransactionType::ServerNonInvite => {
                     self.last_response.take().map(SipMessage::Response)
                 }
-                // Kept on the transaction: the matching ACK ends an Accepted
-                // server INVITE (RFC 6026 §7.1) before the dialog reads the
-                // 2xx it confirms (`DialogState::Confirmed`).
+                // Kept: the matching ACK terminates an Accepted server
+                // INVITE before the dialog reads the 2xx for
+                // `DialogState::Confirmed`.
                 TransactionType::ServerInvite => {
                     self.last_response.clone().map(SipMessage::Response)
                 }

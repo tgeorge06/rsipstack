@@ -157,16 +157,19 @@ impl ClientInviteDialog {
     /// # Returns
     /// * `Ok(())` - BYE was sent successfully or dialog is already terminated.
     /// * `Err(Error)` - Failed to build/send BYE request, or dialog is in a state where BYE does not apply.
+    ///
+    /// Once the BYE is handed to its transaction the dialog is `Terminated`,
+    /// even when an error is returned (RFC 3261 §15.1.1).
     pub async fn bye_with_headers(&self, headers: Option<Vec<crate::sip::Header>>) -> Result<()> {
         if !self.inner.is_confirmed() {
             if !self.inner.is_terminated() {
                 warn!(
                     dialog_id = %self.id(),
-                    state = ?self.state(),
+                    state = %self.state(),
                     "bye skipped: dialog not confirmed"
                 );
                 return Err(crate::Error::Error(format!(
-                    "dialog {} cannot send BYE in state {:?}",
+                    "dialog {} cannot send BYE in state {}",
                     self.id(),
                     self.state()
                 )));
@@ -178,7 +181,7 @@ impl ClientInviteDialog {
             self.inner
                 .make_request(crate::sip::Method::Bye, None, None, None, headers, None)?;
 
-        self.inner.send_bye(request).await
+        self.inner.send_bye(request, TerminatedReason::UacBye).await
     }
 
     /// Send a BYE request with a SIP `Reason` header.
@@ -675,6 +678,11 @@ impl ClientInviteDialog {
             .transition(DialogState::Updated(self.id(), tx.original.clone(), handle))?;
 
         self.inner.process_transaction_handle(tx, rx).await?;
+        let answered_2xx = tx
+            .last_response
+            .as_ref()
+            .is_some_and(|resp| resp.status_code.kind() == crate::sip::StatusCodeKind::Successful);
+        let mut acked = false;
 
         // wait for ACK
         while let Some(msg) = tx.receive().await {
@@ -682,11 +690,15 @@ impl ClientInviteDialog {
                 SipMessage::Request(req) if req.method == crate::sip::Method::Ack => {
                     debug!(id = %self.id(), "received ACK for re-INVITE");
                     self.inner.remote_ack.lock().replace(req);
+                    acked = true;
                     break;
                 }
                 _ => {}
             }
         }
+        self.inner
+            .end_session_without_ack(tx, answered_2xx && !acked)
+            .await;
         Ok(())
     }
 
@@ -696,7 +708,12 @@ impl ClientInviteDialog {
         self.inner
             .transition(DialogState::Refer(self.id(), tx.original.clone(), handle))?;
 
-        self.inner.process_transaction_handle(tx, rx).await
+        // RFC 3515: the REFER was answered (usually 202) and the dialog must
+        // go back to Confirmed — the implicit subscription's NOTIFYs are
+        // in-dialog requests that need the confirmed dialog.
+        let result = self.inner.process_transaction_handle(tx, rx).await;
+        let confirmed = self.return_to_confirmed(tx);
+        result.and(confirmed)
     }
 
     async fn handle_message(&mut self, tx: &mut Transaction) -> Result<()> {

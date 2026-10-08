@@ -351,16 +351,19 @@ impl ServerInviteDialog {
     /// # Returns
     /// * `Ok(())` - BYE was sent successfully or dialog is already terminated.
     /// * `Err(Error)` - Failed to build/send BYE request, or dialog is in a state where BYE does not apply.
+    ///
+    /// Once the BYE is handed to its transaction the dialog is `Terminated`,
+    /// even when an error is returned (RFC 3261 §15.1.1).
     pub async fn bye_with_headers(&self, headers: Option<Vec<crate::sip::Header>>) -> Result<()> {
         if !self.inner.is_confirmed() && !self.inner.waiting_ack() {
             if !self.inner.is_terminated() {
                 warn!(
                     dialog_id = %self.id(),
-                    state = ?self.state(),
+                    state = %self.state(),
                     "bye skipped: dialog not confirmed or waiting ack"
                 );
                 return Err(crate::Error::Error(format!(
-                    "dialog {} cannot send BYE in state {:?}",
+                    "dialog {} cannot send BYE in state {}",
                     self.id(),
                     self.state()
                 )));
@@ -372,7 +375,7 @@ impl ServerInviteDialog {
             self.inner
                 .make_request(crate::sip::Method::Bye, None, None, None, headers, None)?;
 
-        self.inner.send_bye(request).await
+        self.inner.send_bye(request, TerminatedReason::UasBye).await
     }
 
     /// Send a BYE request with a SIP `Reason` header.

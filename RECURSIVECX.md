@@ -6,10 +6,14 @@ below is either offered upstream or removed once rcx stops depending on it.
 The row ids (R2, R3, ...) are those of the convergence ledger
 (`rsipstack-contrib/convergence-ledger.md`).
 
-Base: upstream **0.7.1** (3286e8c). Everything the fork used to carry that
-0.7.1 contains (R1, R4-R11, R13, the R12 teardown) is upstream's version now.
-`ReinviteAck` / `take_reinvite_ack()` (R14) is gone: rcx reads
-`InviteDialog::last_remote_ack()` and matches its CSeq.
+Base: upstream **0.7.3** (2dfa0d1). Everything the fork used to carry that
+0.7.3 contains is upstream's version now: R1, R4-R11, R13, the R12 teardown
+(0.7.1), and R2, R3, R21, R22b, R23 (client lookup), the "BYE ends the dialog
+whatever the outcome" part of R24, and R27 (0.7.3). `ReinviteAck` /
+`take_reinvite_ack()` (R14) is gone: rcx reads
+`InviteDialog::last_remote_ack()` and matches its CSeq. The R23 server-side
+role check on `get_or_create_server_invite` was dropped: rcx routes
+in-dialog requests through `match_dialog` / `get_dialog`.
 
 The fork has one role-agnostic `InviteDialog` (`Dialog::Invite`), as upstream.
 The deprecated `ClientInviteDialog` / `ServerInviteDialog` wrappers carry the
@@ -17,28 +21,16 @@ same patches where they apply.
 
 ## Patches
 
-### R2 + R19: a 1xx to an in-dialog request is not `Early`
+### R19: a 1xx to an in-dialog request is not notified as `Early`
 
 - **Where:** `DialogInner::send_dialog_request`, `Provisional` arm.
 - **What:** `Early` is applied and notified only while the dialog can still be
-  cancelled (Calling / Trying / Early). A 1xx to a re-INVITE or UPDATE on a
-  confirmed dialog neither regresses it (R2, upstream PR #147) nor notifies
-  `Early` (R19), which rcx subscribers read as ringing.
+  cancelled (Calling / Trying / Early). Upstream (#147, R2) no longer
+  regresses a confirmed dialog but still notifies the 1xx as `Early`; the
+  fork does not notify it, since rcx subscribers read `Early` as ringing.
 - **rcx:** the callee-state handlers that match `Early`; the lease-expiry
   fence.
 - **Test:** `dialog::tests::test_in_dialog_provisional`.
-
-### R3: one notification per applied dialog transition
-
-- **Where:** `DialogInner::transition`.
-- **What:** the transition is decided and notified under the state lock.
-  After `Terminated`, nothing more is applied or notified, a second
-  `Terminated` included; a `WaitAck` ignored after `Confirmed` is not
-  notified. Event-only states (`Updated`, `Notify`, `Info`, `Options`,
-  `Refer`) are notified whatever the lifecycle state. Upstream PR #148.
-- **rcx:** the callee-state `Terminated` arm (`sip_session/dialog_events.rs`).
-- **Tests:** `dialog::tests::test_state_after_terminated`, the notification
-  tests at the end of `dialog::tests::test_dialog_states`.
 
 ### R15: response provenance (`Response::synthetic`, `Response::received_from`)
 
@@ -50,7 +42,7 @@ same patches where they apply.
   serialized; `None` / `false` after a reparse.
 - **rcx:** `callrecord/carrier_response.rs`, `callrecord/diagnostics.rs`,
   `rcx-call/src/sip.rs`. Struct literals must set
-  `synthetic: false, received_from: None`.
+  `synthetic: false, received_from: None` (and `wire_reason: None`, R28).
 - **Tests:** `transaction::tests::test_response_provenance`,
   `test_stream_reconnect::test_send_failure_on_stream_is_reported_at_once`.
 
@@ -100,43 +92,21 @@ same patches where they apply.
   `crates/rcx-call/src/sip.rs`.
 - **Test:** `dialog_layer::test_take_dialog_hands_the_dialog_to_exactly_one_caller`.
 
-### R21: a 2xx crossing a taken dialog's CANCEL is BYE'd
-
-- **Where:** `DialogGuardForUnconfirmed` (`src/dialog/invitation.rs`): the
-  `dialog` / `finished` fields and `watch_taken_dialog`.
-- **What:** when another owner took the dialog out of the layer
-  (`take_dialog`) and the `do_invite` future is dropped, the guard keeps the
-  INVITE transaction: in Trying / Early it watches for a 2xx (up to 64*T1)
-  and BYEs it, without a second CANCEL; still in Calling (the owner's hangup
-  could send no CANCEL), it abandons the INVITE as upstream does for a dialog
-  still in the layer.
-- **rcx:** RWI originate `Hangup` arm, `rwi_originate_trunk_e2e_test`.
-- **Tests:** `test_cancel_2xx_race::test_taken_dialog_*`.
-
-### R22a + R22b: raw SIP messages at DEBUG only
+### R22a: raw SIP messages at DEBUG only
 
 - **What:** UDP, stream and WebSocket raw send/receive logs are DEBUG
-  (upstream: INFO). The WebSocket parse failure and the dialog layer's
-  "failed to send request" WARNs carry only the length or the method; the
-  message itself is logged at DEBUG.
-- **Test:** `transport::tests::test_raw_message_log_level` (`bench` feature).
+  (upstream: INFO). The WARNs without the message (R22b) are upstream's.
+- **Tests:** `transport::tests::test_raw_message_log_level` (`bench` feature);
+  upstream's `test_warn_logs` checks the WebSocket receive log at DEBUG.
 
-### R23: role-typed dialog lookups
+### R24: a UAS notifies `Terminated` before sending its BYE
 
-- **What:** `DialogLayer::get_client_dialog_by_call_id` returns UAC dialogs
-  only, and `get_or_create_server_invite` matches existing UAS dialogs only.
-  With a transparent Call-ID the inbound (UAS) and outbound (UAC) legs of a
-  proxied call share it.
-- **rcx:** `rwi/processor/originate.rs` (Hangup, media timeout, transfer, DTMF).
-- **Test:** `dialog_layer::test_lookups_keep_uac_and_uas_dialogs_apart`.
-
-### R24: BYE lifecycle per role
-
-- **Where:** `DialogInner::send_bye`, used by `InviteDialog` and both wrappers.
-- **What:** a UAS notifies `Terminated(UasBye)` before sending the BYE and
-  returns the send result; a UAC notifies `Terminated(UacBye)` after the BYE
-  transaction whatever its outcome. Upstream terminates only after an `Ok`
-  BYE.
+- **Where:** `DialogInner::send_bye`.
+- **What:** a UAS notifies `Terminated(UasBye)` before the BYE is sent, so
+  subscribers never wait for the BYE's response, and returns the send
+  result. Upstream (0.7.3) notifies after the BYE transaction for both roles;
+  the UAC side is upstream's (`Terminated(UacBye)` whatever the outcome, the
+  error still returned).
 - **rcx:** the `Terminated` arms in `sip_session/dialog_events.rs`.
 - **Test:** `dialog::tests::test_bye_lifecycle`.
 
@@ -146,21 +116,16 @@ same patches where they apply.
   `@`, then `callid_suffix`. rcx sets it in `proxy/server.rs`.
 - **Test:** `transaction::tests::tests::test_make_call_id_random22`.
 
-### R27: `Confirmed` carries the 2xx its ACK confirms
+### R28: `Response::wire_reason`
 
-- **Where:** `Transaction::cleanup`: a server INVITE transaction keeps
-  `last_response` (it still hands a copy to `finished_transactions`).
-- **What:** since 0.7.1 the matching ACK ends an `Accepted` server INVITE
-  transaction (RFC 6026 §7.1, upstream #169) before the dialog reads
-  `tx.last_response` for `DialogState::Confirmed`. Upstream then notifies
-  `Confirmed` with `Response::default()` (no CSeq, no headers), for the
-  initial INVITE and every re-INVITE. rcx correlates `Confirmed` by the
-  response's CSeq (`confirms_initial_invite`, `is_reconfirmation`, the
-  re-offer settle).
-- **Test:** `dialog::tests::test_late_reinvite_ack` (CSeq of each
-  `Confirmed`).
+- **Where:** `sip::message::Response`, `sip::parser`.
+- **What:** a known status code whose Status-Line carries a phrase other than
+  the standard one keeps it in `wire_reason` (e.g. `403 Caller Origination
+  Number is Invalid`). Set only by the parser; `Display` is unchanged.
+- **rcx:** `crates/rcx-callrecord/src/carrier_response.rs` (rcx #1135).
+- **Test:** `sip::parser` tests for the custom phrase.
 
-## Upstream 0.7.1 behavior rcx observes (not fork patches)
+## Upstream behavior rcx observes (not fork patches)
 
 - RFC 6026 `Accepted` state. Server: the 2xx is retransmitted by Timer G
   (T1 doubling to T2, every transport) until the matching ACK, which ends the
@@ -172,3 +137,11 @@ same patches where they apply.
 - A dropped INVITE sends no CANCEL before a provisional response; it CANCELs
   on the first provisional, or ACKs and BYEs a 2xx (#162, #171).
 - A forked 2xx is ACKed with its own To tag and remote target (#172).
+- 0.7.3: a BYE ends the dialog whatever its transaction returns (#180); a
+  forked 2xx's dialog is BYE'd (#181); an in-dialog REFER returns the dialog
+  to `Confirmed` once answered; Timer F ends a non-INVITE client
+  transaction in Proceeding (#189); a server in-dialog request with no route
+  and no dial-back fails at once (#187); the deprecated `ClientInviteDialog`
+  ends the session on a never-ACKed re-INVITE 2xx (#185); a dropped INVITE
+  whose dialog was already removed still ends (#183); injectable TLS client
+  seam (rustls stays the default).

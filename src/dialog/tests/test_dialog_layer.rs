@@ -311,87 +311,6 @@ async fn test_take_dialog_hands_the_dialog_to_exactly_one_caller() -> crate::Res
     Ok(())
 }
 
-/// With a transparent Call-ID the inbound (UAS) and outbound (UAC) legs of a
-/// proxied call share it. Role-typed lookups must not hand out the other
-/// role's dialog.
-#[tokio::test]
-async fn test_lookups_keep_uac_and_uas_dialogs_apart() -> crate::Result<()> {
-    let token = CancellationToken::new();
-    let tl = TransportLayer::new(token.child_token());
-    tl.add_transport(create_mock_connection().await?);
-    let endpoint = EndpointBuilder::new()
-        .with_user_agent("rsipstack-test")
-        .with_transport_layer(tl)
-        .build();
-    let dialog_layer = DialogLayer::new(endpoint.inner.clone());
-    let call_id = "shared-call-id";
-
-    // The inbound leg: a server dialog.
-    let invite_req = create_invite_request("caller-tag", "", call_id, "z9hG4bKinbound");
-    let key = TransactionKey::from_request(&invite_req, TransactionRole::Server)?;
-    let tx = Transaction::new_server(
-        key,
-        invite_req,
-        endpoint.inner.clone(),
-        Some(create_mock_connection().await?),
-    );
-    let (state_sender, _) = unbounded_channel();
-    let server = dialog_layer.get_or_create_server_invite(
-        &tx,
-        state_sender,
-        None,
-        Some(crate::sip::Uri::try_from("sip:bob@bob.example.com:5060")?),
-    )?;
-
-    // The outbound leg: a client dialog with the same Call-ID.
-    let (state_sender, _) = unbounded_channel();
-    let (client, _client_tx) = dialog_layer.create_client_invite_dialog(
-        crate::dialog::invitation::InviteOption {
-            caller: crate::sip::Uri::try_from("sip:alice@example.com")?,
-            callee: crate::sip::Uri::try_from("sip:carol@example.com")?,
-            contact: crate::sip::Uri::try_from("sip:alice@127.0.0.1:5060")?,
-            call_id: Some(call_id.to_string()),
-            ..Default::default()
-        },
-        state_sender,
-    )?;
-    assert_eq!(client.id().call_id, call_id);
-    dialog_layer.inner.dialogs.insert(
-        client.id().to_string(),
-        crate::dialog::dialog::Dialog::Invite(client.clone()),
-    );
-
-    let found = dialog_layer.get_client_dialog_by_call_id(call_id);
-    assert_eq!(found.len(), 1, "only the UAC dialog is a client dialog");
-    assert_eq!(found[0].role(), TransactionRole::Client);
-    assert_eq!(found[0].id(), client.id());
-    assert_eq!(server.role(), TransactionRole::Server);
-
-    // An in-dialog request whose id maps to a UAC dialog is not answered by
-    // it as a server dialog.
-    let in_dialog = create_invite_request("far-tag", "near-tag", call_id, "z9hG4bKreinvite");
-    let key = TransactionKey::from_request(&in_dialog, TransactionRole::Server)?;
-    let tx = Transaction::new_server(
-        key,
-        in_dialog,
-        endpoint.inner.clone(),
-        Some(create_mock_connection().await?),
-    );
-    let id = DialogId::try_from(&tx)?;
-    dialog_layer.inner.dialogs.insert(
-        id.to_string(),
-        crate::dialog::dialog::Dialog::Invite(client.clone()),
-    );
-    let (state_sender, _) = unbounded_channel();
-    assert!(
-        dialog_layer
-            .get_or_create_server_invite(&tx, state_sender, None, None)
-            .is_err(),
-        "a UAC dialog must not be returned as the server INVITE dialog"
-    );
-    Ok(())
-}
-
 #[tokio::test]
 async fn test_dialog_layer_with_swapped_tags() -> crate::Result<()> {
     let endpoint = create_test_endpoint().await?;
@@ -500,6 +419,47 @@ async fn test_multiple_dialogs_management() -> crate::Result<()> {
         assert_eq!(dialog_layer.len(), 4);
     }
 
+    Ok(())
+}
+
+/// A B2BUA that keeps the Call-ID has both legs of a call in one dialog layer:
+/// the inbound one as UAS, the outbound one as UAC. Only the UAC one is a
+/// client dialog.
+#[tokio::test]
+async fn test_get_client_dialog_by_call_id_returns_only_uac_dialogs() -> crate::Result<()> {
+    let endpoint = create_test_endpoint().await?;
+    let conn = create_mock_connection().await?;
+    endpoint.inner.transport_layer.add_transport(conn.clone());
+    let dialog_layer = std::sync::Arc::new(DialogLayer::new(endpoint.inner.clone()));
+    let call_id = "b2bua-call-id";
+
+    let invite_req = create_invite_request("caller-tag", "", call_id, "z9hG4bKinbound");
+    let key = TransactionKey::from_request(&invite_req, TransactionRole::Server)?;
+    let tx = Transaction::new_server(key, invite_req, endpoint.inner.clone(), Some(conn));
+    let (state_sender, _) = unbounded_channel();
+    let uas = dialog_layer.get_or_create_server_invite(&tx, state_sender, None, None)?;
+
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let callee = format!("sip:carol@{}", peer.local_addr()?);
+    let (state_sender, _) = unbounded_channel();
+    let (uac, _invite) = dialog_layer.do_invite_async(
+        crate::dialog::invitation::InviteOption {
+            caller: crate::sip::Uri::try_from("sip:alice@example.com")?,
+            callee: crate::sip::Uri::try_from(callee.as_str())?,
+            contact: crate::sip::Uri::try_from("sip:alice@127.0.0.1:5060")?,
+            call_id: Some(call_id.to_string()),
+            ..Default::default()
+        },
+        state_sender,
+    )?;
+
+    let found: Vec<_> = dialog_layer
+        .get_client_dialog_by_call_id(call_id)
+        .iter()
+        .map(|d| (d.role(), d.id()))
+        .collect();
+    assert_eq!(found, vec![(TransactionRole::Client, uac.id())]);
+    assert!(dialog_layer.get_dialog(&uas.id()).is_some());
     Ok(())
 }
 

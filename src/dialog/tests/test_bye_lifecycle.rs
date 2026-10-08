@@ -1,37 +1,23 @@
-//! `bye()` notifies `Terminated` with the lifecycle subscribers rely on to
-//! finish their teardown: a UAC ends the dialog locally even when its BYE
-//! cannot be sent, and a UAS notifies `Terminated` before its BYE's response.
+//! Fork (R24): a UAS `bye()` notifies `Terminated` before the BYE is sent,
+//! so subscribers never wait for the BYE's response. (A UAC terminates after
+//! the BYE transaction whatever its outcome: upstream's behaviour.)
 use crate::dialog::{
     dialog::{DialogInner, DialogState, DialogStateReceiver, TerminatedReason},
     invite_dialog::InviteDialog,
     DialogId,
 };
 use crate::sip::{Method, Request, Response, SipMessage, Uri};
-use crate::transaction::endpoint::{Endpoint, TargetLocator};
+use crate::transaction::endpoint::Endpoint;
 use crate::transaction::key::TransactionRole;
-use crate::transport::{udp::UdpConnection, SipAddr, TransportLayer};
+use crate::transport::{udp::UdpConnection, TransportLayer};
 use crate::EndpointBuilder;
-use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio_util::sync::CancellationToken;
 
-/// A locator that can resolve nothing: every request send fails.
-struct FailingLocator;
-
-#[async_trait]
-impl TargetLocator for FailingLocator {
-    async fn locate(&self, _uri: &Uri) -> crate::Result<SipAddr> {
-        Err(crate::Error::Error("no route".to_string()))
-    }
-}
-
-async fn endpoint(
-    token: &CancellationToken,
-    locator: Option<Box<dyn TargetLocator>>,
-) -> crate::Result<Endpoint> {
+async fn endpoint(token: &CancellationToken) -> crate::Result<Endpoint> {
     let tl = TransportLayer::new(token.child_token());
     let udp = UdpConnection::create_connection(
         "127.0.0.1:0".parse().unwrap(),
@@ -40,15 +26,11 @@ async fn endpoint(
     )
     .await?;
     tl.add_transport(udp.into());
-    let mut builder = EndpointBuilder::new();
-    builder
+    let endpoint = EndpointBuilder::new()
         .with_user_agent("rsipstack-test")
         .with_transport_layer(tl)
-        .with_cancel_token(token.child_token());
-    if let Some(locator) = locator {
-        builder.with_target_locator(locator);
-    }
-    let endpoint = builder.build();
+        .with_cancel_token(token.child_token())
+        .build();
     let inner = endpoint.inner.clone();
     tokio::spawn(async move {
         let _ = inner.serve().await;
@@ -107,39 +89,10 @@ fn confirmed_dialog(
     Ok((InviteDialog::from_inner(Arc::new(inner)), states))
 }
 
-fn terminated(states: &mut DialogStateReceiver) -> Option<TerminatedReason> {
-    let mut reason = None;
-    while let Ok(state) = states.try_recv() {
-        if let DialogState::Terminated(_, r) = state {
-            reason = Some(r);
-        }
-    }
-    reason
-}
-
-#[tokio::test]
-async fn test_uac_bye_that_cannot_be_sent_still_terminates() -> crate::Result<()> {
-    let token = CancellationToken::new();
-    let endpoint = endpoint(&token, Some(Box::new(FailingLocator))).await?;
-    let (dialog, mut states) =
-        confirmed_dialog(&endpoint, TransactionRole::Client, "192.0.2.1:5060")?;
-
-    tokio::time::timeout(Duration::from_secs(2), dialog.bye())
-        .await
-        .expect("bye must not hang")?;
-    assert!(matches!(
-        terminated(&mut states),
-        Some(TerminatedReason::UacBye)
-    ));
-    assert!(dialog.state().is_terminated());
-    token.cancel();
-    Ok(())
-}
-
 #[tokio::test]
 async fn test_uas_bye_notifies_terminated_before_its_response() -> crate::Result<()> {
     let token = CancellationToken::new();
-    let endpoint = endpoint(&token, None).await?;
+    let endpoint = endpoint(&token).await?;
     // A peer that receives the BYE and never answers it.
     let peer = UdpSocket::bind("127.0.0.1:0").await?;
     let (dialog, mut states) = confirmed_dialog(
