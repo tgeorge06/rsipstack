@@ -39,6 +39,7 @@ async fn test_multiple_provisional_responses() -> crate::Result<()> {
     let resp1 = Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         version: crate::sip::Version::V2,
         status_code: StatusCode::SessionProgress, // 183
         headers: vec![
@@ -75,6 +76,7 @@ async fn test_multiple_provisional_responses() -> crate::Result<()> {
     let resp2 = Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         version: crate::sip::Version::V2,
         status_code: StatusCode::SessionProgress, // 183
         headers: vec![

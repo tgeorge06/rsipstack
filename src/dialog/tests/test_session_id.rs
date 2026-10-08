@@ -180,6 +180,7 @@ async fn client_learns_remote_uuid_from_response() -> crate::Result<()> {
     let mut resp = crate::sip::Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: Default::default(),
@@ -271,6 +272,7 @@ async fn make_ack_swaps_remote_uuid_from_response() -> crate::Result<()> {
     let resp = crate::sip::Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: vec![
@@ -303,6 +305,7 @@ async fn make_ack_without_session_id_untouched() -> crate::Result<()> {
     let resp = crate::sip::Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: vec![crate::sip::headers::Contact::new("<sip:bob@bob.example.com:5060>").into()]
@@ -324,6 +327,7 @@ async fn session_id_survives_snapshot_restore() -> crate::Result<()> {
     let mut resp = crate::sip::Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: Default::default(),
@@ -600,6 +604,7 @@ fn ok_response_with(headers: Vec<Header>) -> crate::sip::Response {
     crate::sip::Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: headers.into(),

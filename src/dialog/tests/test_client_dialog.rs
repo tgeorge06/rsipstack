@@ -166,6 +166,7 @@ async fn test_client_dialog_state_transitions() -> crate::Result<()> {
     let ringing_resp = Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::Ringing,
         version: crate::sip::Version::V2,
         headers: vec![
@@ -421,6 +422,7 @@ async fn test_route_set_updates_from_200_ok_response() -> crate::Result<()> {
     let success_resp = Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: headers.into(),
@@ -518,6 +520,7 @@ async fn test_confirmed_dialog_bye_keeps_contact_uri_with_outbound_route() -> cr
     let success_resp = Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: headers.into(),
@@ -1041,6 +1044,7 @@ async fn test_ack_sent_to_websocket_channel_via_locator() -> crate::Result<()> {
     let ok_response = Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::OK,
         version: crate::sip::Version::V2,
         headers: vec![

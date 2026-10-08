@@ -106,6 +106,7 @@ async fn test_cleanup_server_invite_completed_keeps_waiting_ack() -> crate::Resu
     let resp = crate::sip::Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::ServiceUnavailable,
         version: Version::V2,
         headers: invite.headers.clone(),
@@ -161,6 +162,7 @@ async fn test_cleanup_server_invite_terminated_removes_waiting_ack() -> crate::R
     let resp = crate::sip::Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::BusyHere,
         version: Version::V2,
         headers: invite.headers.clone(),
@@ -643,6 +645,7 @@ async fn test_cleanup_server_invite_confirmed_drop_removes_waiting_ack() -> crat
     let resp = crate::sip::Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::ServiceUnavailable,
         version: Version::V2,
         headers: invite.headers.clone(),
@@ -706,6 +709,7 @@ async fn test_timer_cleanup_removes_orphaned_waiting_ack() -> crate::Result<()> 
     let resp = crate::sip::Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::ServiceUnavailable,
         version: Version::V2,
         headers: invite.headers.clone(),

@@ -247,6 +247,7 @@ impl EndpointInner {
         Response {
             synthetic: false,
             received_from: None,
+            wire_reason: None,
             status_code,
             version: *req.version(),
             headers,

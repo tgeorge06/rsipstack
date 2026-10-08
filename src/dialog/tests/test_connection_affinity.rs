@@ -312,6 +312,7 @@ async fn test_server_dialog_bye_is_delivered_over_initial_connection() {
     let ok_response = Response {
         synthetic: false,
         received_from: None,
+        wire_reason: None,
         status_code: StatusCode::OK,
         version: Version::V2,
         headers: vec![
