@@ -342,7 +342,6 @@ impl StreamConnection for WebSocketConnection {
                         }
                         Err(e) => {
                             warn!(error = %e, src = %remote_addr, len = text.len(), "Error parsing SIP message");
-                            debug!(src = %remote_addr, raw_message = ?text.as_str(), "unparsable SIP message");
                         }
                     }
                 }

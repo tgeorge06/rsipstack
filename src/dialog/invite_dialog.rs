@@ -22,7 +22,7 @@ use crate::transaction::key::TransactionRole;
 use crate::transaction::transaction::{Transaction, TransactionEvent};
 use crate::Result;
 use core::sync::atomic::Ordering;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Unified INVITE dialog that can act as either a UAS (Server) or UAC (Client).
 ///
@@ -418,6 +418,55 @@ impl InviteDialog {
         Ok(())
     }
 
+    /// End a forked dialog a later 2xx established (RFC 3261 §13.2.2.4).
+    ///
+    /// Called from the Accepted-window drainer for every message the client
+    /// INVITE transaction delivers after the dialog confirmed. A 2xx whose To
+    /// tag differs from the confirmed dialog's is a forked branch: the
+    /// transaction has already ACKed it, and the UAC — keeping a single
+    /// session — terminates it with a BYE. Everything else (retransmitted
+    /// 2xx with the same tag, non-2xx) is ignored. `seen` holds the forked
+    /// tags already BYE'd, so a retransmitted forked 2xx sends one BYE only.
+    pub(super) async fn end_forked_branch(
+        &self,
+        msg: &SipMessage,
+        confirmed_remote_tag: &str,
+        seen: &mut Vec<String>,
+    ) {
+        let SipMessage::Response(resp) = msg else {
+            return;
+        };
+        if resp.status_code.kind() != StatusCodeKind::Successful {
+            return;
+        }
+        // Same tag: a retransmission of the confirmed 2xx, already re-ACKed.
+        let tag = match resp
+            .to_header()
+            .ok()
+            .and_then(|to| to.tag().ok().flatten())
+            .map(|tag| tag.value().to_string())
+        {
+            Some(tag) => tag,
+            None => return,
+        };
+        if tag == confirmed_remote_tag {
+            return;
+        }
+        if seen.iter().any(|seen| seen == &tag) {
+            return;
+        }
+        seen.push(tag.clone());
+        let id = self.id();
+        info!(
+            id = %id,
+            tag = %tag,
+            "forked 2xx acknowledged; ending the extra branch with a BYE (RFC 3261 §13.2.2.4)"
+        );
+        if let Err(e) = self.inner.bye_forked_branch(resp).await {
+            warn!(id = %id, tag = %tag, error = %e, "failed to BYE the forked branch");
+        }
+    }
+
     // ── Shared request semantics ──────────────────────────────────────────
 
     /// Send a BYE request to terminate the dialog.
@@ -433,14 +482,12 @@ impl InviteDialog {
     /// dialogs remain a silent no-op.
     ///
     /// # Returns
-    /// * `Ok(())` - BYE was sent (or, for a UAC, attempted) or the dialog is
-    ///   already terminated.
-    /// * `Err(Error)` - Failed to build the BYE, the dialog is in a state
-    ///   where BYE does not apply, or (UAS) the BYE could not be sent.
+    /// * `Ok(())` - BYE was sent successfully or dialog is already terminated.
+    /// * `Err(Error)` - Failed to build/send BYE request, or dialog is in a state where BYE does not apply.
     ///
-    /// `Terminated` is notified even when the BYE fails: a UAS notifies it
-    /// before sending, a UAC once the BYE transaction ends (see
-    /// `DialogInner::send_bye`).
+    /// Once the BYE is handed to its transaction the dialog is `Terminated`,
+    /// even when an error is returned (RFC 3261 §15.1.1). A UAS notifies it
+    /// before sending the BYE (fork, R24; see `DialogInner::send_bye`).
     pub async fn bye_with_headers(&self, headers: Option<Vec<Header>>) -> Result<()> {
         let confirmed_or_waiting_ack = self.inner.is_confirmed()
             || (self.role() == TransactionRole::Server && self.inner.waiting_ack());
@@ -448,11 +495,11 @@ impl InviteDialog {
             if !self.inner.is_terminated() {
                 warn!(
                     dialog_id = %self.id(),
-                    state = ?self.state(),
+                    state = %self.state(),
                     "bye skipped: dialog not confirmed or waiting ack"
                 );
                 return Err(crate::Error::Error(format!(
-                    "dialog {} cannot send BYE in state {:?}",
+                    "dialog {} cannot send BYE in state {}",
                     self.id(),
                     self.state()
                 )));
@@ -464,7 +511,11 @@ impl InviteDialog {
             .inner
             .make_request(Method::Bye, None, None, None, headers, None)?;
 
-        self.inner.send_bye(request).await
+        let reason = match self.role() {
+            TransactionRole::Server => TerminatedReason::UasBye,
+            TransactionRole::Client => TerminatedReason::UacBye,
+        };
+        self.inner.send_bye(request, reason).await
     }
 
     /// Send a BYE request with a SIP `Reason` header.
@@ -822,7 +873,12 @@ impl InviteDialog {
         self.inner
             .transition(DialogState::Refer(self.id(), tx.original.clone(), handle))?;
 
-        self.inner.process_transaction_handle(tx, rx).await
+        // RFC 3515: the REFER was answered (usually 202) and the dialog must
+        // go back to Confirmed — the implicit subscription's NOTIFYs are
+        // in-dialog requests that need the confirmed dialog.
+        let result = self.inner.process_transaction_handle(tx, rx).await;
+        let confirmed = self.return_to_confirmed(tx);
+        result.and(confirmed)
     }
 
     async fn handle_message(&mut self, tx: &mut Transaction) -> Result<()> {

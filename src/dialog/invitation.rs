@@ -187,33 +187,8 @@ pub(super) struct DialogGuardForUnconfirmed<'a> {
     pub dialog_layer_inner: &'a DialogLayerInnerRef,
     pub id: &'a DialogId,
     invite_tx: Option<Transaction>,
-    /// The dialog itself, so a 2xx crossing a CANCEL sent by another owner
-    /// (one that took the dialog out of the layer) can still be BYE'd.
-    dialog: InviteDialog,
-    /// `process_invite` ran to completion: nothing left to watch.
-    finished: bool,
-}
-
-impl DialogGuardForUnconfirmed<'_> {
-    /// Dropped mid-INVITE after another owner took the dialog out of the
-    /// layer (`DialogLayer::take_dialog`) to end it. That owner does not hold
-    /// the INVITE transaction, so a 2xx crossing its CANCEL would be ACKed
-    /// by the transaction and never BYE'd. Keep the transaction and watch it
-    /// (up to 64*T1) for a 2xx to BYE. No second CANCEL is sent: the owner
-    /// sent it.
-    fn watch_taken_dialog(&mut self, client_dialog: InviteDialog) {
-        let Some(mut invite_tx) = self.invite_tx.take() else {
-            return;
-        };
-        debug!(id = %client_dialog.id(), "taken dialog dropped mid-INVITE, watching for a 2xx");
-        crate::platform::spawn(async move {
-            invite_tx.stop_retransmissions();
-            let window = invite_tx.endpoint_inner.option.t1x64;
-            let final_response = wait_response(&mut invite_tx, window, true).await;
-            drop(invite_tx);
-            bye_if_2xx(&client_dialog, final_response).await;
-        });
-    }
+    /// The INVITE's dialog, `None` once `process_invite` returned.
+    dialog: Option<InviteDialog>,
 }
 
 impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
@@ -221,24 +196,13 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
         let client_dialog = match self.dialog_layer_inner.dialogs.remove(&self.id.to_string()) {
             Some(Dialog::Invite(client_dialog)) => client_dialog,
             Some(_) => return,
-            // Another owner took the dialog out of the layer to end it.
-            None => {
-                if self.finished {
-                    return;
-                }
-                let client_dialog = self.dialog.clone();
-                match client_dialog.state() {
-                    // The owner's hangup sent nothing (no CANCEL before a
-                    // provisional response): abandon the INVITE as if the
-                    // dialog were still in the layer.
-                    DialogState::Calling(_) => client_dialog,
-                    DialogState::Trying(_) | DialogState::Early(_, _) => {
-                        self.watch_taken_dialog(client_dialog);
-                        return;
-                    }
-                    _ => return,
-                }
-            }
+            // The application already removed the dialog from the layer
+            // (`DialogLayer::remove_dialog`): its INVITE still has to end.
+            None => match self.dialog.take() {
+                Some(client_dialog) => client_dialog,
+                // `process_invite` returned: `do_invite` handles the outcome.
+                None => return,
+            },
         };
 
         match client_dialog.state() {
@@ -730,8 +694,7 @@ impl DialogLayer {
             dialog_layer_inner: &self.inner,
             id: &id,
             invite_tx: Some(tx),
-            dialog: dialog.clone(),
-            finished: false,
+            dialog: Some(dialog.clone()),
         };
 
         let tx = guard
@@ -740,7 +703,7 @@ impl DialogLayer {
             .expect("transcation should be avaible");
 
         let r = dialog.process_invite(tx).boxed().await;
-        guard.finished = true;
+        guard.dialog = None;
         self.inner.dialogs.remove(&id.to_string());
 
         match r {
@@ -764,8 +727,14 @@ impl DialogLayer {
                         // here would leave it (and its timers) in the
                         // endpoint's table and silently stop the re-ACKs.
                         if let Some(mut tx) = guard.invite_tx.take() {
+                            let dlg = dialog.clone();
+                            let confirmed_tag = new_dialog_id.remote_tag.clone();
                             crate::platform::spawn(async move {
-                                while tx.receive().await.is_some() {}
+                                let mut seen_forks: Vec<String> = Vec::new();
+                                while let Some(msg) = tx.receive().await {
+                                    dlg.end_forked_branch(&msg, &confirmed_tag, &mut seen_forks)
+                                        .await;
+                                }
                                 debug!(id = %new_dialog_id, "accepted transaction drained (Timer M expired)");
                             });
                         }
@@ -840,8 +809,15 @@ impl DialogLayer {
                         // observes forked 2xx, and detaches it from the
                         // endpoint's table). See do_invite for the rationale.
                         let confirmed_id = new_id.clone();
+                        let confirmed_tag = new_id.remote_tag.clone();
+                        let forked_dlg = dialog_clone.clone();
                         crate::platform::spawn(async move {
-                            while tx.receive().await.is_some() {}
+                            let mut seen_forks: Vec<String> = Vec::new();
+                            while let Some(msg) = tx.receive().await {
+                                forked_dlg
+                                    .end_forked_branch(&msg, &confirmed_tag, &mut seen_forks)
+                                    .await;
+                            }
                             debug!(id = %confirmed_id, "accepted transaction drained (Timer M expired)");
                         });
                     }
